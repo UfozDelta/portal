@@ -11,17 +11,33 @@ import yaml
 from ..detect import ProjectPlan
 
 
+class _ResetList(list):
+    """Marker list dumped with the compose `!reset` tag.
+
+    Compose merges `ports` (and a few other list-valued keys) across `-f`
+    files by concatenation, not replacement, so a plain `ports: []` in the
+    override is silently ignored and the project's own host-port publication
+    survives. `!reset` tells Compose to discard the earlier layers' value for
+    this key instead of merging into it — that is what actually strips host
+    ports.
+    """
+
+
+def _represent_reset_list(dumper: yaml.Dumper, data: "_ResetList"):
+    return dumper.represent_sequence("!reset", list(data))
+
+
+yaml.SafeDumper.add_representer(_ResetList, _represent_reset_list)
+
+
 def build_override(plan: ProjectPlan) -> dict:
     """Override doc: deterministic container name, portal network, labels, and
     no host port publication.
 
-    `ports: []` replaces the project's own list — compose merges mappings but
-    replaces sequences at the service level for `ports`, so an empty list is
-    what actually strips host publication.
-
-    `networks` is replaced the same way, so portal's network is appended to the
-    ones the service already had rather than substituted for them — otherwise a
-    service would lose its link to the rest of its own stack.
+    `networks` is replaced the normal (merge-by-map-key) way, so portal's
+    network is appended to the ones the service already had rather than
+    substituted for them — otherwise a service would lose its link to the
+    rest of its own stack.
     """
     networks = [n for n in plan.service_networks if n != "portal"]
     networks.append("portal")
@@ -30,7 +46,7 @@ def build_override(plan: ProjectPlan) -> dict:
         "services": {
             plan.service: {
                 "container_name": plan.container_name,
-                "ports": [],
+                "ports": _ResetList(),
                 "expose": [str(plan.port)],
                 "networks": networks,
                 "restart": "unless-stopped",
