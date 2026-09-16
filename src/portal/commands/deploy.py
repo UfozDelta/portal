@@ -115,7 +115,9 @@ def run(
     click.echo(f"==> CNAME {host} -> {dns_mod.tunnel_target(tunnel_id)} (proxied)")
 
     # f. deploy scripts into the target project, never overwriting.
-    written = scaffold.scaffold_deploy_scripts(plan.source_path)
+    written = scaffold.scaffold_deploy_scripts(
+        plan.source_path, compose_project=plan.compose_project, compose_files=files
+    )
     click.echo(
         f"==> scaffolded {', '.join(written)}"
         if written
