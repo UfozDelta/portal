@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 220" width="720" height="220" role="img" aria-labelledby="title desc">
+  <title id="title">portal</title>
+  <desc id="desc">A dockerized project on the left, an arrow labeled deploy() through portal, ending at a public HTTPS hostname behind a Cloudflare Tunnel on the right.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="arrow" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#38bdf8"/>
+      <stop offset="1" stop-color="#f97316"/>
+    </linearGradient>
+    <marker id="head" markerWidth="10" markerHeight="10" refX="7" refY="3.5" orient="auto">
+      <path d="M0,0 L7,3.5 L0,7 Z" fill="#f97316"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="720" height="220" rx="16" fill="url(#bg)"/>
+
+  <!-- left: dockerized project -->
+  <g transform="translate(36,62)">
+    <rect x="0" y="0" width="150" height="96" rx="10" fill="#1e293b" stroke="#334155"/>
+    <circle cx="24" cy="24" r="9" fill="#38bdf8"/>
+    <circle cx="46" cy="24" r="9" fill="#38bdf8" opacity="0.7"/>
+    <circle cx="68" cy="24" r="9" fill="#38bdf8" opacity="0.4"/>
+    <rect x="16" y="46" width="118" height="8" rx="4" fill="#475569"/>
+    <rect x="16" y="62" width="90" height="8" rx="4" fill="#475569"/>
+    <rect x="16" y="78" width="70" height="8" rx="4" fill="#475569"/>
+    <text x="75" y="-12" text-anchor="middle" fill="#94a3b8" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="13">docker compose / Dockerfile</text>
+  </g>
+
+  <!-- arrow -->
+  <line x1="200" y1="110" x2="330" y2="110" stroke="url(#arrow)" stroke-width="3" marker-end="url(#head)"/>
+  <text x="265" y="96" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="14" font-weight="600">deploy()</text>
+
+  <!-- portal node -->
+  <g transform="translate(330,62)">
+    <rect x="0" y="0" width="120" height="96" rx="10" fill="#1e293b" stroke="#f97316" stroke-width="1.5"/>
+    <text x="60" y="42" text-anchor="middle" fill="#f97316" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="20" font-weight="700">portal</text>
+    <text x="60" y="64" text-anchor="middle" fill="#94a3b8" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11">no CLI</text>
+    <text x="60" y="80" text-anchor="middle" fill="#94a3b8" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11">just .env</text>
+  </g>
+
+  <!-- arrow -->
+  <line x1="450" y1="110" x2="560" y2="110" stroke="url(#arrow)" stroke-width="3" marker-end="url(#head)"/>
+  <text x="505" y="96" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="12">tunnel + DNS</text>
+
+  <!-- right: public hostname -->
+  <g transform="translate(560,50)">
+    <rect x="0" y="0" width="128" height="120" rx="10" fill="#1e293b" stroke="#334155"/>
+    <circle cx="64" cy="30" r="16" fill="none" stroke="#38bdf8" stroke-width="2.5"/>
+    <path d="M64,14 a16,16 0 0 1 0,32 a16,16 0 0 1 0,-32" fill="none"/>
+    <path d="M48,30 h32 M64,14 c8,4 8,28 0,32 M64,14 c-8,4 -8,28 0,32" stroke="#38bdf8" stroke-width="1.5" fill="none"/>
+    <rect x="14" y="58" width="100" height="10" rx="5" fill="#0f172a" stroke="#22c55e"/>
+    <text x="64" y="66" text-anchor="middle" fill="#22c55e" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="8">https://</text>
+    <text x="64" y="94" text-anchor="middle" fill="#e2e8f0" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11" font-weight="600">app.example.com</text>
+    <text x="64" y="110" text-anchor="middle" fill="#4ade80" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10">● live</text>
+  </g>
+
+  <text x="360" y="200" text-anchor="middle" fill="#64748b" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="12">no host ports · one tunnel per project · curl-verified</text>
+</svg>

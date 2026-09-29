@@ -15,6 +15,11 @@ from ..errors import CloudflareError, redact
 
 BASE_URL = "https://api.cloudflare.com/client/v4"
 RETRY_STATUSES = {429, 500, 502, 503, 504}
+# Only retry a bad status on methods where re-sending is safe. A POST that got
+# a 5xx may have already been applied server-side (a tunnel or DNS record
+# actually created) before the response was lost — retrying it risks creating
+# a duplicate. GET/PUT/DELETE are idempotent, so re-sending is always safe.
+IDEMPOTENT_METHODS = {"GET", "PUT", "DELETE"}
 MAX_ATTEMPTS = 4
 
 
@@ -53,7 +58,11 @@ class CloudflareClient:
                 time.sleep(2 ** (attempt - 1))
                 continue
 
-            if resp.status_code in RETRY_STATUSES and attempt < MAX_ATTEMPTS:
+            if (
+                resp.status_code in RETRY_STATUSES
+                and method in IDEMPOTENT_METHODS
+                and attempt < MAX_ATTEMPTS
+            ):
                 time.sleep(2 ** (attempt - 1))
                 continue
 
@@ -92,17 +101,32 @@ class CloudflareClient:
     def delete(self, path: str) -> dict:
         return self.request("DELETE", path)
 
-    def verify_token(self) -> dict:
+    def verify_token(self, account_id: str | None = None) -> dict:
         """Prove the token is live and unexpired.
 
         /user/tokens/verify only recognizes classic *User* API Tokens. A newer
         *Account-Owned* API Token is equally valid but gets rejected there with
         the same "1000: Invalid API Token" error a genuinely bad token would
-        give — a known Cloudflare false negative, not a real auth failure. So:
-        try the user-token endpoint first for a nice status string, and on a
-        1000 specifically, fall back to proving liveness via /accounts instead
-        (which both token types can call) rather than reporting failure.
+        give — a known Cloudflare false negative, not a real auth failure.
+
+        When account_id is known, /accounts/{id}/tokens/verify is the right
+        check to make first: it verifies the token against itself, scoped to
+        one account, and needs no permission beyond what the token already
+        has — unlike the /accounts list fallback below, which needs a broad
+        Account:Read scope that a minimally-scoped account-owned token (just
+        Tunnel:Edit/DNS:Edit/Zone:Read, say) may not have, and would then
+        fail even though the token is genuinely fine.
         """
+        if account_id:
+            try:
+                return self.get(f"/accounts/{account_id}/tokens/verify")["result"]
+            except CloudflareError as exc:
+                if "1000:" not in str(exc):
+                    raise
+                # not a real User token either — fall through to the
+                # unscoped checks below, which still correctly reject a
+                # genuinely bad token.
+
         try:
             return self.get("/user/tokens/verify")["result"]
         except CloudflareError as exc:

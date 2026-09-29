@@ -1,0 +1,122 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 460" width="900" height="460" role="img" aria-labelledby="title desc">
+  <title id="title">deploy() flow</title>
+  <desc id="desc">Eight ordered steps: detect project, docker compose up with ports stripped, wait for the container to be running, create or reuse a Cloudflare Tunnel, start the cloudflared sidecar, set ingress, upsert the DNS CNAME, then curl the hostname until it answers and record state.</desc>
+  <defs>
+    <style>
+      .card { fill:#1e293b; stroke:#334155; }
+      .num  { fill:#f97316; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:13px; font-weight:700; }
+      .ttl  { fill:#e2e8f0; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:13px; font-weight:600; }
+      .sub  { fill:#94a3b8; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:10.5px; }
+    </style>
+    <marker id="fh" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="900" height="460" rx="16" fill="#0f172a"/>
+  <text x="24" y="32" fill="#e2e8f0" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="16" font-weight="700">deploy(path, host, docker_host=None)</text>
+
+  <!-- row 1: 1-4 -->
+  <g transform="translate(24,56)">
+    <!-- 1 detect -->
+    <g>
+      <rect class="card" width="190" height="82" rx="10"/>
+      <text class="num" x="14" y="24">1</text>
+      <text class="ttl" x="34" y="24">detect</text>
+      <text class="sub" x="14" y="44">compose file or Dockerfile,</text>
+      <text class="sub" x="14" y="58">pick service + port</text>
+    </g>
+    <line x1="190" y1="41" x2="216" y2="41" stroke="#475569" stroke-width="2" marker-end="url(#fh)"/>
+
+    <!-- 2 docker up -->
+    <g transform="translate(216,0)">
+      <rect class="card" width="190" height="82" rx="10"/>
+      <text class="num" x="14" y="24">2</text>
+      <text class="ttl" x="34" y="24">docker compose up</text>
+      <text class="sub" x="14" y="44">override: ports !override []</text>
+      <text class="sub" x="14" y="58">local, or over ssh://</text>
+    </g>
+    <line x1="406" y1="41" x2="432" y2="41" stroke="#475569" stroke-width="2" marker-end="url(#fh)"/>
+
+    <!-- 3 wait -->
+    <g transform="translate(432,0)">
+      <rect class="card" width="190" height="82" rx="10"/>
+      <text class="num" x="14" y="24">3</text>
+      <text class="ttl" x="34" y="24">wait for Up</text>
+      <text class="sub" x="14" y="44">poll container status</text>
+      <text class="sub" x="14" y="58">before touching Cloudflare</text>
+    </g>
+    <line x1="622" y1="41" x2="648" y2="41" stroke="#475569" stroke-width="2" marker-end="url(#fh)"/>
+
+    <!-- 4 tunnel -->
+    <g transform="translate(648,0)">
+      <rect class="card" width="190" height="82" rx="10"/>
+      <text class="num" x="14" y="24">4</text>
+      <text class="ttl" x="34" y="24">create/reuse tunnel</text>
+      <text class="sub" x="14" y="44">portal-&lt;slug&gt;</text>
+      <text class="sub" x="14" y="58">config_src: cloudflare</text>
+    </g>
+  </g>
+
+  <!-- wrap down -->
+  <line x1="838" y1="97" x2="838" y2="150" stroke="#475569" stroke-width="2"/>
+  <line x1="838" y1="150" x2="814" y2="150" stroke="#475569" stroke-width="2" marker-end="url(#fh)"/>
+
+  <!-- row 2: 5-8, right to left -->
+  <g transform="translate(24,166)">
+    <!-- 8 state (rightmost, but drawn last visually connect) -->
+    <g transform="translate(648,0)">
+      <rect class="card" width="190" height="82" rx="10"/>
+      <text class="num" x="14" y="24">8</text>
+      <text class="ttl" x="34" y="24">save state</text>
+      <text class="sub" x="14" y="44">~/.portal/state.json</text>
+      <text class="sub" x="14" y="58">atomic write, no secrets</text>
+    </g>
+    <line x1="648" y1="41" x2="622" y2="41" stroke="#475569" stroke-width="2" marker-end="url(#fh)"/>
+
+    <!-- 7 curl verify -->
+    <g transform="translate(432,0)">
+      <rect class="card" width="190" height="82" rx="10" stroke="#22c55e"/>
+      <text class="num" x="14" y="24">7</text>
+      <text class="ttl" x="34" y="24">curl-verify</text>
+      <text class="sub" x="14" y="44">retry https://host</text>
+      <text class="sub" x="14" y="58">up to 60s for HTTP 200</text>
+    </g>
+    <line x1="432" y1="41" x2="406" y2="41" stroke="#475569" stroke-width="2" marker-end="url(#fh)"/>
+
+    <!-- 6 dns -->
+    <g transform="translate(216,0)">
+      <rect class="card" width="190" height="82" rx="10"/>
+      <text class="num" x="14" y="24">6</text>
+      <text class="ttl" x="34" y="24">DNS CNAME</text>
+      <text class="sub" x="14" y="44">-&gt; &lt;tunnel&gt;.cfargotunnel.com</text>
+      <text class="sub" x="14" y="58">refuses unowned records</text>
+    </g>
+    <line x1="216" y1="41" x2="190" y2="41" stroke="#475569" stroke-width="2" marker-end="url(#fh)"/>
+
+    <!-- 5 cloudflared + ingress -->
+    <g>
+      <rect class="card" width="190" height="82" rx="10"/>
+      <text class="num" x="14" y="24">5</text>
+      <text class="ttl" x="34" y="24">cloudflared + ingress</text>
+      <text class="sub" x="14" y="44">sidecar container,</text>
+      <text class="sub" x="14" y="58">token via env not argv</text>
+    </g>
+  </g>
+
+  <!-- result -->
+  <g transform="translate(24,284)">
+    <rect width="814" height="70" rx="10" fill="#111827" stroke="#f97316" stroke-dasharray="4 4"/>
+    <text x="20" y="30" class="ttl" fill="#f97316">DeployResult</text>
+    <text x="20" y="52" class="sub">live_url · tunnel_id · container_status · cloudflared_status · verified · probe</text>
+  </g>
+
+  <text x="24" y="392" fill="#64748b" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11">No confirmation prompt anywhere in this path — the caller (script, agent, chat) owns that decision.</text>
+  <text x="24" y="410" fill="#64748b" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11">Step 2 targets a remote docker daemon transparently when docker_host="ssh://user@host" is set — steps 1 and 4-8 are unaffected.</text>
+
+  <!-- legend -->
+  <g transform="translate(24,428)">
+    <rect width="14" height="14" rx="3" fill="none" stroke="#22c55e"/>
+    <text x="20" y="12" class="sub">verification step (fails loud, not silent)</text>
+  </g>
+</svg>

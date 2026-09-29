@@ -75,7 +75,7 @@ def upsert_cname(client, zone_id: str, fqdn: str, tunnel_id: str, slug: str) -> 
             f"A DNS record for {fqdn} already exists ({existing.get('type')} -> "
             f"{existing.get('content')}) and is not marked as managed by "
             f"portal:{slug}. Refusing to overwrite it. Remove it by hand, or "
-            f"pick a different --host."
+            f"pick a different host."
         )
 
     return client.put(

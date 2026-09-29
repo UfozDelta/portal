@@ -1,3 +1,3 @@
-from . import docker, override, scaffold
+from . import docker, override
 
-__all__ = ["docker", "override", "scaffold"]
+__all__ = ["docker", "override"]

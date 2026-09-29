@@ -1,5 +1,12 @@
 """Thin subprocess wrapper around the docker CLI.
 
+Every function takes an optional `docker_host`. When set (e.g.
+`ssh://user@1.2.3.4`), it's passed to the docker CLI as DOCKER_HOST — the
+docker CLI itself proxies the connection over SSH to a remote dockerd, so
+every command here runs against a remote machine's docker with no portal
+install needed there: only `docker` (client-side) and `ssh` on PATH locally,
+and `docker` + sshd reachable on the remote end.
+
 Not covered by automated tests in this phase: exercising these paths needs a
 live docker daemon. The boundary is deliberately narrow (one `run` function) so
 a later phase can mock it in one place.
@@ -7,6 +14,7 @@ a later phase can mock it in one place.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -21,29 +29,58 @@ def _require_docker() -> str:
     return exe
 
 
-def ensure_daemon_running() -> None:
+def _build_env(
+    docker_host: str | None, extra: dict[str, str] | None = None
+) -> dict[str, str] | None:
+    """None means "inherit the parent process's environment unchanged" — the
+    subprocess.run default. Only build an explicit copy when there's actually
+    something to override, so the common local case doesn't pay for a dict
+    copy on every call."""
+    if docker_host is None and not extra:
+        return None
+    env = dict(os.environ)
+    if docker_host:
+        env["DOCKER_HOST"] = docker_host
+    if extra:
+        env.update(extra)
+    return env
+
+
+def ensure_daemon_running(*, docker_host: str | None = None) -> None:
     """Fail fast with a clear message if the docker daemon isn't reachable.
 
     `docker` being on PATH doesn't mean the daemon is up (Docker Desktop
-    stopped, dockerd not started, etc.) — `docker info` is the cheapest call
-    that actually talks to the daemon rather than just the CLI.
+    stopped, dockerd not started, a remote host unreachable over SSH, etc.) —
+    `docker info` is the cheapest call that actually talks to the daemon
+    rather than just the CLI.
     """
     exe = _require_docker()
     try:
         proc = subprocess.run(
-            [exe, "info"], capture_output=True, text=True, check=False
+            [exe, "info"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=_build_env(docker_host),
         )
     except OSError as exc:
         raise DockerError(f"Could not run `docker info`: {exc}") from None
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
+        where = f" at {docker_host}" if docker_host else ""
         raise DockerError(
-            "Docker daemon is not reachable (is Docker Desktop / dockerd running?).\n"
-            f"{detail}"
+            f"Docker daemon is not reachable{where} (is it running, and if "
+            f"remote, is SSH access to it working?).\n{detail}"
         )
 
 
-def run(args: list[str], *, capture: bool = True, check: bool = True) -> str:
+def run(
+    args: list[str],
+    *,
+    capture: bool = True,
+    check: bool = True,
+    env: dict[str, str] | None = None,
+) -> str:
     """Run a docker command. Returns stdout when capturing."""
     cmd = [_require_docker(), *args]
     try:
@@ -52,6 +89,7 @@ def run(args: list[str], *, capture: bool = True, check: bool = True) -> str:
             capture_output=capture,
             text=True,
             check=False,
+            env=env,
         )
     except OSError as exc:
         raise DockerError(f"Could not run `docker {' '.join(args)}`: {exc}") from None
@@ -64,23 +102,29 @@ def run(args: list[str], *, capture: bool = True, check: bool = True) -> str:
     return (proc.stdout or "") if capture else ""
 
 
-def ensure_network(name: str) -> None:
+def ensure_network(name: str, *, docker_host: str | None = None) -> None:
     """Create the bridge network if it does not exist."""
-    existing = run(["network", "ls", "--format", "{{.Name}}"]).split()
+    env = _build_env(docker_host)
+    existing = run(["network", "ls", "--format", "{{.Name}}"], env=env).split()
     if name not in existing:
-        run(["network", "create", name])
+        run(["network", "create", name], env=env)
 
 
-def remove_network(name: str) -> None:
+def remove_network(name: str, *, docker_host: str | None = None) -> None:
     """Best effort: the network may already be gone, or still hold containers."""
     try:
-        run(["network", "rm", name])
+        run(["network", "rm", name], env=_build_env(docker_host))
     except DockerError:
         pass
 
 
 def compose_up(
-    *, project: str, files: list[Path], build: bool = True, env_file: Path | None = None
+    *,
+    project: str,
+    files: list[Path],
+    build: bool = True,
+    env_file: Path | None = None,
+    docker_host: str | None = None,
 ) -> None:
     args = ["compose", "-p", project]
     for f in files:
@@ -90,11 +134,15 @@ def compose_up(
     args += ["up", "-d"]
     if build:
         args.append("--build")
-    run(args, capture=False)
+    run(args, capture=False, env=_build_env(docker_host))
 
 
 def compose_down(
-    *, project: str, files: list[Path], volumes: bool = False
+    *,
+    project: str,
+    files: list[Path],
+    volumes: bool = False,
+    docker_host: str | None = None,
 ) -> None:
     args = ["compose", "-p", project]
     for f in files:
@@ -102,17 +150,20 @@ def compose_down(
     args.append("down")
     if volumes:
         args.append("--volumes")
-    run(args, capture=False, check=False)
+    run(args, capture=False, check=False, env=_build_env(docker_host))
 
 
-def run_cloudflared(*, container: str, network: str, token: str) -> None:
+def run_cloudflared(
+    *, container: str, network: str, token: str, docker_host: str | None = None
+) -> None:
     """Start this project's own cloudflared sidecar.
 
-    The token is passed via `--env TUNNEL_TOKEN=...` in the argv of a subprocess
-    we control; it is never echoed, and DockerError messages from here are built
-    from stderr only after the caller redacts.
+    `--env TUNNEL_TOKEN` (no `=value`) tells docker to pass the value through
+    from this process's own environment instead of putting the token in the
+    `docker run` argv, where it would be visible to anything that can list
+    processes on the host.
     """
-    remove_container(container)
+    remove_container(container, docker_host=docker_host)
     run(
         [
             "run",
@@ -126,27 +177,25 @@ def run_cloudflared(*, container: str, network: str, token: str) -> None:
             "--label",
             "portal.managed=true",
             "--env",
-            f"TUNNEL_TOKEN={token}",
+            "TUNNEL_TOKEN",
             "cloudflare/cloudflared:latest",
             "tunnel",
             "--no-autoupdate",
             "run",
-        ]
+        ],
+        env=_build_env(docker_host, {"TUNNEL_TOKEN": token}),
     )
 
 
-def remove_container(name: str) -> None:
-    run(["rm", "-f", name], check=False)
+def remove_container(name: str, *, docker_host: str | None = None) -> None:
+    run(["rm", "-f", name], check=False, env=_build_env(docker_host))
 
 
-def container_status(name: str) -> str:
+def container_status(name: str, *, docker_host: str | None = None) -> str:
     """Human-readable state of one container, or 'not found'."""
     out = run(
         ["ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.Status}}"],
         check=False,
+        env=_build_env(docker_host),
     ).strip()
     return out.splitlines()[0] if out else "not found"
-
-
-def connect_network(container: str, network: str) -> None:
-    run(["network", "connect", network, container], check=False)

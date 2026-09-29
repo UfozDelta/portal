@@ -120,3 +120,13 @@ def test_no_secret_fields_on_the_record():
     """state.json must never hold the API token or a tunnel token."""
     fields = set(ProjectRecord.__dataclass_fields__)
     assert not {f for f in fields if "token" in f or "secret" in f}
+
+
+def test_docker_host_defaults_to_local(store):
+    store.put(make_record())
+    assert store.get("demo").docker_host == ""
+
+
+def test_docker_host_roundtrips_for_remote_deploys(store):
+    store.put(make_record(docker_host="ssh://user@1.2.3.4"))
+    assert store.get("demo").docker_host == "ssh://user@1.2.3.4"

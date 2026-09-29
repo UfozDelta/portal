@@ -1,0 +1,77 @@
+"""`python -m portal <command> ...` — a thin shell convenience over api.py.
+No prompts, no separate init step. All real logic lives in api.py; this just
+prints its results."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+
+from . import api
+from .errors import PortalError
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m portal")
+    parser.add_argument("-v", "--verbose", action="store_true", help="show progress")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_deploy = sub.add_parser("deploy", help="deploy PATH and publish it at --host")
+    p_deploy.add_argument("path")
+    p_deploy.add_argument("--host", required=True)
+    p_deploy.add_argument("--port", type=int, default=None)
+    p_deploy.add_argument("--service", default=None)
+    p_deploy.add_argument(
+        "--docker-host",
+        default=None,
+        help="run containers on a remote docker daemon, e.g. ssh://user@1.2.3.4",
+    )
+
+    p_destroy = sub.add_parser("destroy", help="tear down a deployment")
+    p_destroy.add_argument("slug")
+    p_destroy.add_argument("--volumes", action="store_true")
+    p_destroy.add_argument(
+        "--docker-host", default=None, help="override the host recorded at deploy time"
+    )
+
+    p_status = sub.add_parser("status", help="report what portal has deployed")
+    p_status.add_argument("slug", nargs="?", default=None)
+    p_status.add_argument("--no-probe", action="store_true")
+
+    p_inspect = sub.add_parser("inspect", help="report what would be deployed")
+    p_inspect.add_argument("path")
+    p_inspect.add_argument("--port", type=int, default=None)
+    p_inspect.add_argument("--service", default=None)
+
+    args = parser.parse_args(argv)
+    if args.verbose:
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    try:
+        if args.command == "deploy":
+            result = api.deploy(
+                args.path,
+                args.host,
+                port=args.port,
+                service=args.service,
+                docker_host=args.docker_host,
+            )
+            print(f"live at {result.live_url}  ({result.probe})")
+        elif args.command == "destroy":
+            result = api.destroy(args.slug, volumes=args.volumes, docker_host=args.docker_host)
+            print(f"destroyed {result.slug}")
+        elif args.command == "status":
+            for r in api.status(args.slug, probe=not args.no_probe):
+                print(f"{r.record.slug}  https://{r.record.fqdn}  {r.probe or ''}")
+        elif args.command == "inspect":
+            plan = api.inspect(args.path, port=args.port, service=args.service)
+            print(plan.to_dict())
+    except PortalError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

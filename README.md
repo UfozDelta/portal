@@ -1,11 +1,16 @@
 # portal
 
-Point portal at a dockerized project and a hostname. It builds and starts the
-project with no host ports published, gives it its own Cloudflare Tunnel, runs a
-dedicated `cloudflared` sidecar beside it, and points DNS at the tunnel. The
-machine ends up with nothing listening on a public port.
+<p align="center"><img src="docs/hero.svg" alt="portal: point a dockerized project at a hostname, get a public tunnel" width="720"></p>
 
-One tunnel per project. One `cloudflared` container per project. Nothing shared.
+portal is a small Python library for putting a dockerized project on a public
+hostname through Cloudflare Tunnel. You give it a project directory and a
+hostname. It builds and starts the project without publishing any host ports,
+creates a tunnel just for that project, runs a `cloudflared` sidecar next to
+it, points DNS at the tunnel, and then keeps requesting the hostname until
+something answers.
+
+Each project gets its own tunnel and its own `cloudflared` container. Projects
+share nothing, so tearing one down can't take another with it.
 
 ## Install
 
@@ -14,77 +19,181 @@ python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e .
 ```
 
-Needs Python 3.11+, `docker` on PATH, and a Cloudflare API token.
+You need Python 3.11+, the `docker` CLI on PATH with Compose 2.24 or newer (the
+reason is under [What deploy() does](#what-deploy-does)), and a Cloudflare API
+token.
 
-## Cloudflare token
+## Configuration
 
-Create a scoped API token with:
+All configuration lives in one `.env` file:
+
+```bash
+cp .env.example .env
+```
+
+```dotenv
+CLOUDFLARE_API_TOKEN=...     # required
+CLOUDFLARE_ACCOUNT_ID=...    # optional; looked up from the token if missing
+```
+
+The token needs three permissions:
 
 - Account → Cloudflare Tunnel → Edit
 - Zone → DNS → Edit
 - Zone → Zone → Read
 
-Give it to portal either way:
+Real environment variables win over the file. portal finds the file by walking
+up from the current directory. To use a different file, set `PORTAL_ENV_FILE`
+or pass `env_file=` to `deploy()` or `destroy()`. `status()` and `inspect()`
+don't need the token at all.
 
-```bash
-export CLOUDFLARE_API_TOKEN=...      # checked first
-portal init --token ...              # or write ~/.portal/credentials.toml
+This `.env` belongs to portal. It has nothing to do with the `.env` of the
+project you're deploying. portal never reads that file's values: it passes the
+path to `docker compose --env-file`, and it only looks at which key names from
+the project's `.env.example` are missing.
+
+## Usage
+
+```python
+from portal.api import deploy, destroy, status, inspect
+
+inspect("~/code/myapp")                 # detected plan, no side effects
+
+r = deploy("~/code/myapp", host="app.example.com")
+r.live_url, r.verified, r.probe         # 'https://app.example.com', True, 'HTTP 200'
+
+status()                                # every deployment: containers + a live probe
+destroy("myapp")                        # DNS record, tunnel, containers, state entry
 ```
 
-The token is read from the environment first and falls back to
-`~/.portal/credentials.toml`. It is never written to `state.json` and never
-printed, including inside error messages. On POSIX the credentials file is
-chmod 0600; **on Windows portal does not set an ACL on it yet** — treat the file
-as a secret and lock it down yourself.
+`deploy()` also accepts `port=` and `service=` for cases where detection
+guesses wrong or the compose file has several candidate services.
 
-Your project's own `.env` is never read or copied. portal only checks which
-*key names* from `.env.example` are missing from it.
+None of these calls ask for confirmation. `deploy()` creates real Cloudflare
+resources and `destroy()` deletes them, so if a human needs to approve that
+first, the caller has to handle it. Failures raise `PortalError` with a message
+you can show to a person as-is.
 
-## Commands
+<p align="center"><img src="docs/flow.svg" alt="deploy() flow: detect, docker up, wait, tunnel, ingress, DNS, curl-verify" width="720"></p>
 
-| command | what it does |
-| --- | --- |
-| `portal init [--token T]` | Verifies the token, caches the account id, creates `~/.portal/`. |
-| `portal inspect PATH [--port N] [--service S] [--json]` | Reports what would be deployed. Changes nothing. |
-| `portal deploy PATH --host FQDN [--port N] [--service S] [--yes]` | Deploys and publishes. Prompts before creating cloud resources unless `--yes`. |
-| `portal status [SLUG] [--no-probe]` | Container state plus an HTTPS probe of the hostname. |
-| `portal destroy SLUG [--yes] [--volumes]` | Removes DNS, tunnel, containers, state entry. Preserves volumes unless `--volumes`. |
+## What deploy() does
 
-## Example
+1. **Detect.** Finds the compose file, or a bare Dockerfile, and picks the
+   service to expose.
+2. **Start the app.** Runs `docker compose -p portal-<slug> -f <yours> -f
+   <override> up -d --build`. portal never edits your compose file. It adds an
+   override on top that sets a fixed `container_name`, joins the service to a
+   per-project network (keeping any networks it already had), adds `portal.*`
+   labels, and sets `ports: !override []`.
 
-```bash
-export CLOUDFLARE_API_TOKEN=...
-portal init
-portal inspect ~/code/myapp
-portal deploy ~/code/myapp --host app.example.com
-portal status
-portal destroy myapp
+   The `!override` tag is required. Compose normally merges lists, so a plain
+   `ports: []` would leave your existing port mappings in place. This merge tag
+   needs Compose 2.24 or newer.
+
+   For a project with only a Dockerfile, portal generates a minimal compose
+   file under `~/.portal/projects/<slug>/`, not inside your project.
+3. **Wait for the container.** `compose up -d` returns as soon as the
+   container is created, even if the container crashes a second later. portal
+   waits up to 30 seconds for `docker ps` to report the container as `Up`, and
+   raises an error otherwise. Cloudflare isn't touched until the container is
+   running.
+4. **Create the tunnel.** portal creates a tunnel named `portal-<slug>`, or
+   reuses it if it already exists. The tunnel uses `config_src: cloudflare`, so
+   its ingress rules are managed through the API instead of a local config file.
+5. **Start the sidecar.** Runs `cloudflare/cloudflared:latest` as
+   `portal-<slug>-cloudflared` on the same network. The tunnel token is passed
+   to it through the environment, so it never appears in the `docker run`
+   arguments.
+6. **Set ingress.** One rule for the hostname, followed by the required
+   `http_status:404` catch-all.
+7. **Point DNS.** portal finds the zone by trying each parent domain of the
+   hostname, longest first. It then creates or updates a proxied CNAME to
+   `<tunnel-id>.cfargotunnel.com` with the comment `managed by
+   portal:<slug>`. If a record already exists for that name without this exact
+   comment, portal refuses to change it. `destroy()` follows the same rule
+   before deleting a record.
+8. **Verify.** portal requests `https://<host>` every 3 seconds for up to a
+   minute. A new tunnel and DNS record often take a few seconds before they
+   route traffic, so a single check right after setup would usually fail even
+   when everything is fine. Any HTTP response counts as success, including an
+   error status from Cloudflare's edge. Check `probe` for the actual status, not
+   just `verified`. If the minute runs out, `deploy()` still returns normally,
+   with `verified=False`.
+9. **Record.** Writes the deployment to `~/.portal/state.json`. The file
+   contains IDs and paths, never secrets.
+
+`destroy()` runs these steps in reverse. If removing the DNS record or deleting
+the tunnel fails, it logs a warning and continues, so a Cloudflare problem
+never leaves containers running with no record of them.
+
+## Remote hosts over SSH
+
+The docker CLI supports `DOCKER_HOST=ssh://user@host`, which runs each command
+against the Docker daemon on another machine over SSH. portal exposes this as
+`docker_host=`:
+
+```python
+deploy(
+    "~/code/myapp",
+    host="app.example.com",
+    docker_host="ssh://deploy@203.0.113.9",
+)
 ```
 
-## What deploy actually does
+The remote machine only needs `docker` and `sshd`. portal doesn't need to be
+installed there. The project directory stays on your machine, and
+`docker compose build` sends the build context over the SSH connection.
 
-1. Creates a docker network `portal-<slug>`.
-2. `docker compose -p portal-<slug> -f <your compose> -f <portal override> up -d --build`.
-   Your compose file is never modified — the override layers on top of it, adding
-   a deterministic `container_name`, the portal network, `portal.*` labels, and
-   `ports: []` so nothing is published to the host. A Dockerfile-only project gets
-   a minimal compose file synthesized under `~/.portal/projects/<slug>/`.
-3. Creates a Cloudflare Tunnel named `portal-<slug>` with `config_src: cloudflare`,
-   so its ingress is managed over the API rather than by a local config file.
-4. Runs `cloudflare/cloudflared:latest` as `portal-<slug>-cloudflared` on the same
-   network, with the tunnel token in its environment.
-5. Sets the tunnel ingress to one hostname rule plus the mandatory
-   `http_status:404` catch-all, in that order.
-6. Resolves the zone for the hostname and upserts a proxied CNAME to
-   `<tunnel-id>.cfargotunnel.com`, stamped `comment: managed by portal:<slug>`.
-   A pre-existing record without that stamp is refused, not overwritten.
-7. Scaffolds `deploy.sh` and `deploy.bat` into your project **only if absent**.
-8. Records the deployment in `~/.portal/state.json` (atomic write, no secrets).
+Requirements:
+
+- `ssh` on your local PATH.
+- **Key-based** SSH access to the remote account.
+- Docker running on the remote machine, with that user in the `docker` group.
+
+Pass `docker_host` only to `deploy()`. It's saved in `state.json`, and
+`status()` and `destroy()` read it from there, so local and remote deployments
+work together without extra arguments. You can override the saved value by
+passing `docker_host` to `destroy()` explicitly.
+
+### Password-only SSH won't work
+
+When `DOCKER_HOST` is set, docker runs `ssh` itself as a subprocess with no
+terminal attached, so a password prompt can't be answered. The deploy either
+hangs or fails, and there's no reliable way to supply the password. Set up a
+key first:
+
+```bash
+# dedicated keypair (or reuse one you already have)
+ssh-keygen -t ed25519 -f ~/.ssh/portal_deploy -C "portal-deploy"
+
+# install it; this is the last time you'll type the password
+ssh-copy-id -i ~/.ssh/portal_deploy.pub deploy@203.0.113.9
+
+# no ssh-copy-id (plain Windows)? From PowerShell:
+type $env:USERPROFILE\.ssh\portal_deploy.pub | ssh deploy@203.0.113.9 "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"
+
+# should print "ok" without asking for anything
+ssh -i ~/.ssh/portal_deploy deploy@203.0.113.9 echo ok
+```
+
+Then add the host to `~/.ssh/config` so plain `ssh://deploy@203.0.113.9`
+picks up the key:
+
+```
+Host 203.0.113.9
+    User deploy
+    IdentityFile ~/.ssh/portal_deploy
+```
+
+If you can't add a key to the remote account, `docker_host` won't work for
+that machine. Run portal on the remote machine itself and leave out
+`docker_host`.
 
 ## Scope
 
-Phase 1: the five commands above, one project at a time, happy path. No drift
-detection, no rollback, no daemon, no shared tunnels.
+portal deploys one project per call and assumes things go right. It has no
+drift detection, no rollback, no background daemon, and no shared tunnels.
+`status()` only reports problems and never fixes anything.
 
 ## Tests
 
@@ -93,6 +202,24 @@ pip install -e ".[dev]"
 pytest
 ```
 
-Covers detection, ingress rule building, the state store, the override builder
-and the scaffold/DNS-ownership rules. Live Cloudflare calls and real
-`docker compose` runs are not automated — they need credentials and a daemon.
+The tests cover project detection, ingress rule building, the state store,
+the compose override and synthesized compose files, the DNS ownership checks,
+the docker environment handling for `docker_host`, `.env` loading, and the
+full `deploy()`/`status()`/`destroy()` orchestration with docker and
+Cloudflare stubbed out. None of this touches a real Docker daemon or the
+Cloudflare API, so `pytest` needs no credentials.
+
+To actually verify a token against the live Cloudflare API — creates a
+throwaway tunnel, confirms it, deletes it, confirms it's gone — run:
+
+```bash
+PORTAL_RUN_LIVE_TESTS=1 pytest -m live -s -v tests/test_live_cloudflare.py
+```
+
+This is opt-in and double-gated (it's excluded from a plain `pytest` run and
+still skips without the env var even if you ask for `-m live`), because it
+creates and deletes a real resource under your account. Add
+`PORTAL_LIVE_TEST_ZONE=example.com` to also check zone visibility, and
+`PORTAL_LIVE_TEST_DNS=1` on top of that to exercise a real CNAME create/delete
+as well — that one briefly writes a public DNS record, so it's a separate
+opt-in from the tunnel check.

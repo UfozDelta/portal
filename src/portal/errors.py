@@ -3,8 +3,8 @@ be actionable and must never contain a credential."""
 
 
 class PortalError(Exception):
-    """Base for anything portal raises deliberately. cli.py catches this and
-    prints the message without a traceback."""
+    """Base for anything portal raises deliberately. Callers of api.py (or the
+    __main__ shim) catch this and print the message without a traceback."""
 
     exit_code = 1
 

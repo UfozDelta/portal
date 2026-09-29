@@ -37,6 +37,10 @@ class ProjectRecord:
     deployed_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
     )
+    # e.g. "ssh://user@1.2.3.4" when this project runs on a remote docker
+    # daemon. Empty means local. Kept so status()/destroy() automatically
+    # target the same machine deploy() used, without having to repeat it.
+    docker_host: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
