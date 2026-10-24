@@ -34,6 +34,12 @@ def find_tunnel(client, account_id: str, slug: str) -> dict | None:
     return results[0] if results else None
 
 
+def get_tunnel(client, account_id: str, tunnel_id: str) -> dict:
+    """The tunnel as Cloudflare sees it, including `status` (healthy, degraded,
+    down, inactive) and its live `connections`."""
+    return client.get(f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}")["result"]
+
+
 def get_tunnel_token(client, account_id: str, tunnel_id: str) -> str:
     """The tunnel run token. This is a credential — never log or store it."""
     token = client.get(f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}/token")["result"]

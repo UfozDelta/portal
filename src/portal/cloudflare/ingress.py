@@ -53,3 +53,11 @@ def put_config(client, account_id: str, tunnel_id: str, config: dict) -> dict:
     return client.put(
         f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations", json=config
     )["result"]
+
+
+def get_config(client, account_id: str, tunnel_id: str) -> dict:
+    """The ingress rules currently set on the tunnel (empty if never set)."""
+    result = client.get(
+        f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations"
+    )["result"]
+    return (result or {}).get("config") or {}

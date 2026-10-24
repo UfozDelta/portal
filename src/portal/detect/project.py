@@ -74,6 +74,7 @@ class ProjectPlan:
                 "has_example": self.env.has_example,
                 "has_env": self.env.has_env,
                 "missing_keys": self.env.missing_keys,
+                "empty_keys": self.env.empty_keys,
             },
         }
 

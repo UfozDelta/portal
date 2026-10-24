@@ -58,18 +58,27 @@ A few optional environment variables change portal's own behavior:
 This `.env` belongs to portal. It has nothing to do with the `.env` of the
 project you're deploying. portal never reads that file's values: it passes the
 path to `docker compose --env-file`, and it only looks at which key names from
-the project's `.env.example` are missing.
+the project's `.env.example` are missing or blank.
+
+`deploy()` refuses to start if the project's `.env` doesn't cover its
+`.env.example`: a key is missing, or it's blank while the example gives it a
+value (a blank in the example marks the key as optional). Pass
+`strict_env=False`, or `--allow-missing-env` on the command line, to log a
+warning instead.
 
 ## Usage
 
 ```python
-from portal.api import check, deploy, destroy, status, inspect
+from portal.api import check, deploy, destroy, status, inspect, verify
 
 check("app.example.com").ok             # token active and able to deploy there?
 inspect("~/code/myapp")                 # detected plan, no side effects
 
 r = deploy("~/code/myapp", host="app.example.com")
 r.live_url, r.verified, r.probe         # 'https://app.example.com', True, 'HTTP 200'
+r.health.ok                             # env, containers, tunnel, ingress, DNS, HTTP
+
+verify("myapp").ok                      # the same health checks, any time later
 
 status()                                # every deployment: containers + a live probe
 destroy("myapp")                        # DNS record, tunnel, containers, state entry
@@ -91,8 +100,8 @@ you can show to a person as-is.
 
 portal logs progress to the `portal` logger. Call
 `logging.basicConfig(level=logging.INFO)` to watch a deploy step by step.
-Warnings, such as keys from the project's `.env.example` that are missing from
-its `.env`, show up even without that.
+Warnings, such as a deployment that finished with failing health checks, show
+up even without that.
 
 ### Checking the token
 
@@ -101,10 +110,10 @@ each result:
 
 ```text
 $ python -m portal check --host app.example.com
-ok    token    active account token, expires 2027-01-31
-ok    tunnels  can list tunnels
-ok    zone     example.com covers app.example.com
-ok    dns      can read DNS records in example.com
+ok    token       active account token, expires 2027-01-31
+ok    tunnels     can list tunnels
+ok    zone        example.com covers app.example.com
+ok    dns         can read DNS records in example.com
 ```
 
 It confirms the token is active (not expired, disabled, or revoked) and warns
@@ -119,6 +128,31 @@ way to tell Read access from Edit access without writing something. A token
 with Read-only permissions passes `check()` and then fails at the first write
 during `deploy()`.
 
+### Health checks
+
+`deploy()` finishes by running the health checks and returns them as
+`result.health`. `verify(slug)` runs the same checks on an existing deployment.
+Neither raises when a check fails; the report says which piece is broken, and
+the deployment stays in place so you can fix it or `destroy()` it.
+
+```text
+$ python -m portal verify myapp
+ok    env         .env covers .env.example
+ok    app         Up 2 minutes
+ok    cloudflared Up 2 minutes
+ok    tunnel      healthy, 4 connections
+ok    ingress     app.example.com -> http://portal-myapp-app:8080
+ok    dns         app.example.com -> <tunnel-id>.cfargotunnel.com (proxied)
+ok    http        HTTP 200
+```
+
+A container that isn't running is reported with its last few log lines. The
+tunnel check reads the status and connection count from Cloudflare, so a
+crashed or misconfigured `cloudflared` shows up directly instead of only as a
+failed HTTP request. `verify` needs the Cloudflare token for the tunnel,
+ingress and DNS checks; without one it still runs the local checks and says the
+rest were skipped. It exits with status 1 if any check fails.
+
 ### From the shell
 
 The same calls are available as a thin command-line wrapper:
@@ -127,13 +161,15 @@ The same calls are available as a thin command-line wrapper:
 python -m portal check --host app.example.com
 python -m portal -v deploy ~/code/myapp --host app.example.com
 python -m portal inspect ~/code/myapp
+python -m portal verify myapp
 python -m portal status
 python -m portal destroy myapp
 ```
 
 `deploy` and `inspect` take `--port`, `--service`, and `--name`. `deploy` also
-takes `--docker-host`. `check` and `destroy` exit with status 1 on failure or,
-for `destroy`, partial cleanup.
+takes `--docker-host` and `--allow-missing-env`. `check`, `verify` and `destroy`
+exit with status 1 on failure or, for `destroy`, partial cleanup. `deploy` exits
+with 1 if any health check fails.
 
 <p align="center"><img src="docs/flow.svg" alt="deploy() flow: detect, docker up, wait, tunnel, ingress, DNS, curl-verify" width="720"></p>
 
@@ -141,7 +177,8 @@ for `destroy`, partial cleanup.
 
 1. **Detect.** Finds the compose file, or a bare Dockerfile, and picks the
    service to expose. A service using `network_mode` is rejected, because
-   compose can't attach it to portal's network.
+   compose can't attach it to portal's network. Missing or blank keys from
+   `.env.example` stop the deploy here (see [Configuration](#configuration)).
 2. **Check credentials.** Runs the same read-only checks as `check()` and stops
    with a list of what failed. Nothing has been started or created yet.
 3. **Start the app.** Runs `docker compose -p portal-<slug> -f <yours> -f
@@ -186,6 +223,8 @@ for `destroy`, partial cleanup.
    reach the app (502, 504, 520–530) don't count, and portal keeps polling.
    If the minute runs out, `deploy()` still returns normally, with
    `verified=False`. `probe` has the last status.
+10. **Health report.** Runs the [health checks](#health-checks) and attaches
+    them as `result.health`.
 
 The deployment is recorded in `~/.portal/state.json` as each resource is
 created, not only at the end. A deploy that fails halfway can still be cleaned
@@ -278,7 +317,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-The tests cover project detection, ingress rule building, the state store and
+The tests cover project detection, the health checks, ingress rule building, the state store and
 its lock, the compose override and synthesized compose files, the token checks,
 zone lookup and the DNS ownership checks, the docker environment handling for `docker_host`,
 `.env` loading, and the full `deploy()`/`status()`/`destroy()` orchestration

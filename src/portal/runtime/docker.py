@@ -201,3 +201,10 @@ def container_status(name: str, *, docker_host: str | None = None) -> str:
         env=_build_env(docker_host),
     ).strip()
     return out.splitlines()[0] if out else "not found"
+
+
+def container_logs(name: str, *, tail: int = 5, docker_host: str | None = None) -> str:
+    """The last few log lines of one container, or '' if there are none."""
+    return run(
+        ["logs", "--tail", str(tail), name], check=False, env=_build_env(docker_host)
+    ).strip()

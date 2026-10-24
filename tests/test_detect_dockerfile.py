@@ -76,3 +76,16 @@ def test_parse_keys_handles_export_and_blank_lines(tmp_path):
     f = tmp_path / ".env"
     f.write_text("\n# c\nexport FOO=1\nBARE_NO_EQUALS\nBAR=2\n")
     assert parse_keys(f) == ["FOO", "BAR"]
+
+
+def test_env_report_flags_blank_values_unless_the_example_is_blank(tmp_path):
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / ".env.example").write_text("URL=https://x\nOPTIONAL=\nQUOTED=abc\n")
+    (project / ".env").write_text("URL=\nOPTIONAL=\nQUOTED=''\n")
+
+    report = check_env(project)
+    assert report.missing_keys == []
+    # OPTIONAL is blank in the example too, so a blank there is fine
+    assert report.empty_keys == ["URL", "QUOTED"]
+    assert report.problems == ["URL", "QUOTED"]

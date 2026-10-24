@@ -19,6 +19,14 @@ from portal.errors import CloudflareError, ConfigError, OwnershipError, PortalEr
 from portal.state import StateStore
 
 
+@pytest.fixture(autouse=True)
+def _lenient_env(monkeypatch):
+    """The fixture project ships a .env.example but no .env. Most tests aren't
+    about that, so let them deploy; the strict-env tests pass strict_env=True."""
+    real = api.deploy
+    monkeypatch.setattr(api, "deploy", lambda *a, **kw: real(*a, **{"strict_env": False, **kw}))
+
+
 def _mock_everything(monkeypatch, tmp_path):
     monkeypatch.setenv("PORTAL_HOME", str(tmp_path / ".portal"))
 
@@ -53,6 +61,29 @@ def _mock_everything(monkeypatch, tmp_path):
     )
 
     monkeypatch.setattr(api, "_probe", lambda fqdn: "HTTP 200")
+    # the Cloudflare reads behind the tunnel/ingress/DNS health checks
+    monkeypatch.setattr(
+        api.tunnel_mod, "get_tunnel", lambda *a, **kw: {"status": "healthy", "connections": [{}]}
+    )
+    monkeypatch.setattr(
+        api.ingress_mod,
+        "get_config",
+        lambda *a, **kw: {
+            "ingress": [
+                {"hostname": "app.example.com", "service": "http://portal-simple-dockerfile-app:8080"},
+                {"service": "http_status:404"},
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        api.dns_mod,
+        "get_record",
+        lambda *a, **kw: {
+            "name": "app.example.com",
+            "content": "tun-abc.cfargotunnel.com",
+            "proxied": True,
+        },
+    )
 
 
 def _fast_clock(monkeypatch):
@@ -323,3 +354,96 @@ def test_redeploy_same_host_keeps_record(monkeypatch, tmp_path, fixtures_dir):
 
     monkeypatch.setattr(api.dns_mod, "delete_record", must_not_delete)
     api.deploy(str(fixtures_dir / "simple_dockerfile"), "app.example.com", env_file=_env_file(tmp_path))
+
+
+def test_deploy_fails_before_starting_when_env_keys_are_missing(
+    monkeypatch, tmp_path, fixtures_dir
+):
+    _mock_everything(monkeypatch, tmp_path)
+
+    def must_not_start(**kw):
+        raise AssertionError("compose up must not run with an incomplete .env")
+
+    monkeypatch.setattr(api.docker, "compose_up", must_not_start)
+    with pytest.raises(ConfigError, match="API_KEY, DEBUG"):
+        api.deploy(
+            str(fixtures_dir / "simple_dockerfile"),
+            "app.example.com",
+            env_file=_env_file(tmp_path),
+            strict_env=True,
+        )
+    assert StateStore().get("simple-dockerfile") is None
+
+
+def test_deploy_reports_a_full_health_check(monkeypatch, tmp_path, fixtures_dir):
+    _mock_everything(monkeypatch, tmp_path)
+    result = api.deploy(
+        str(fixtures_dir / "simple_dockerfile"),
+        "app.example.com",
+        port=8080,
+        env_file=_env_file(tmp_path),
+    )
+    names = [c.name for c in result.health.checks]
+    assert names == ["env", "app", "cloudflared", "tunnel", "ingress", "dns", "http"]
+    # the fixture's .env.example is not covered, and that is reported, not fatal
+    failed = [c.name for c in result.health.checks if not c.ok]
+    assert failed == ["env"]
+
+
+def test_deploy_health_names_the_broken_piece(monkeypatch, tmp_path, fixtures_dir):
+    _mock_everything(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        api.tunnel_mod, "get_tunnel", lambda *a, **kw: {"status": "down", "connections": []}
+    )
+    monkeypatch.setattr(api, "_probe", lambda fqdn: "HTTP 530 (Cloudflare could not reach the app through the tunnel)")
+    _fast_clock(monkeypatch)
+    result = api.deploy(
+        str(fixtures_dir / "simple_dockerfile"),
+        "app.example.com",
+        port=8080,
+        env_file=_env_file(tmp_path),
+    )
+    by_name = {c.name: c for c in result.health.checks}
+    assert not by_name["tunnel"].ok and "down" in by_name["tunnel"].detail
+    assert not by_name["http"].ok
+
+
+def test_verify_checks_a_deployed_project(monkeypatch, tmp_path, fixtures_dir):
+    _mock_everything(monkeypatch, tmp_path)
+    api.deploy(
+        str(fixtures_dir / "simple_dockerfile"),
+        "app.example.com",
+        port=8080,
+        env_file=_env_file(tmp_path),
+    )
+    report = api.verify("simple-dockerfile", env_file=_env_file(tmp_path))
+    by_name = {c.name: c for c in report.checks}
+    assert by_name["tunnel"].ok and by_name["ingress"].ok and by_name["dns"].ok
+    assert by_name["http"].ok
+
+    # without a token, the Cloudflare checks are skipped and said to be
+    report = api.verify("simple-dockerfile", env_file=tmp_path / "nonexistent.env")
+    names = [c.name for c in report.checks]
+    assert "tunnel" not in names and "cloudflare" in names
+
+
+def test_health_shows_logs_of_a_crashed_cloudflared(monkeypatch, tmp_path, fixtures_dir):
+    _mock_everything(monkeypatch, tmp_path)
+    api.deploy(
+        str(fixtures_dir / "simple_dockerfile"),
+        "app.example.com",
+        port=8080,
+        env_file=_env_file(tmp_path),
+    )
+    monkeypatch.setattr(
+        api.docker,
+        "container_status",
+        lambda name, **kw: "Exited (1) 3 seconds ago" if name.endswith("cloudflared") else "Up 1 minute",
+    )
+    monkeypatch.setattr(
+        api.docker, "container_logs", lambda *a, **kw: "ERR Unauthorized: invalid tunnel token"
+    )
+    report = api.verify("simple-dockerfile", env_file=_env_file(tmp_path), probe=False)
+    cf = next(c for c in report.checks if c.name == "cloudflared")
+    assert not cf.ok
+    assert "Exited (1)" in cf.detail and "invalid tunnel token" in cf.detail

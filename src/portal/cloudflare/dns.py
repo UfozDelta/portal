@@ -50,6 +50,10 @@ def find_record(client, zone_id: str, fqdn: str) -> dict | None:
     return results[0] if results else None
 
 
+def get_record(client, zone_id: str, record_id: str) -> dict:
+    return client.get(f"/zones/{zone_id}/dns_records/{record_id}")["result"]
+
+
 def tunnel_target(tunnel_id: str) -> str:
     return f"{tunnel_id}.cfargotunnel.com"
 

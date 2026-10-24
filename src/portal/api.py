@@ -24,9 +24,11 @@ from .cloudflare import ingress as ingress_mod
 from .cloudflare import tunnels as tunnel_mod
 from .cloudflare.client import CloudflareClient
 from .cloudflare.credentials import CredentialReport
+from . import health as health_mod
 from .config import project_dir, resource_prefix
 from .detect import ProjectPlan, detect
 from .errors import ConfigError, DockerError, OwnershipError, PortalError
+from .health import HealthReport
 from .runtime import docker, override
 from .settings import Settings, load_settings
 from .state import ProjectRecord, StateStore
@@ -36,6 +38,7 @@ log = logging.getLogger("portal")
 __all__ = [
     "CredentialReport",
     "DeployResult",
+    "HealthReport",
     "DestroyResult",
     "StatusResult",
     "check",
@@ -43,6 +46,7 @@ __all__ = [
     "destroy",
     "status",
     "inspect",
+    "verify",
 ]
 
 
@@ -58,6 +62,10 @@ class DeployResult:
     cloudflared_status: str
     verified: bool
     probe: str
+    # Every check in one place (env, containers, tunnel, ingress, DNS, HTTP).
+    # Never raised on: a failed check shows up here, with the deployment left
+    # in place for destroy() or a fix and redeploy.
+    health: HealthReport
 
 
 @dataclass(frozen=True)
@@ -215,6 +223,7 @@ def deploy(
     name: str | None = None,
     env_file: str | Path | None = None,
     docker_host: str | None = None,
+    strict_env: bool = True,
 ) -> DeployResult:
     """Deploy PATH and publish it at HOST. Creates real Cloudflare resources
     and starts containers — no confirmation prompt, the caller owns that.
@@ -226,6 +235,10 @@ def deploy(
     read locally (portal, not the remote box, needs the compose/Dockerfile);
     only the container runtime moves. Requires `ssh` on PATH locally and
     key-based access to a docker-capable account on the remote host.
+
+    `strict_env` (default) refuses to start when a key listed in the project's
+    .env.example is missing from its .env, or blank there while the example
+    gives it a value. Pass False to only log a warning.
 
     State is saved as each resource is created, not only at the end, so a
     deploy that fails halfway can still be cleaned up with destroy().
@@ -240,12 +253,14 @@ def deploy(
             f"{previous.source_path}. Pass name= to deploy {plan.source_path} "
             f"under a different name, or destroy('{plan.slug}') first."
         )
-    if plan.env.missing_keys:
-        log.warning(
-            "%s is missing keys listed in .env.example: %s",
-            plan.source_path / ".env",
-            ", ".join(plan.env.missing_keys),
-        )
+    if plan.env.problems:
+        env_path = plan.source_path / ".env"
+        if strict_env:
+            raise ConfigError(
+                f"{env_path} doesn't cover .env.example ({plan.env.describe()}). "
+                f"Fix it, or pass strict_env=False to deploy anyway."
+            )
+        log.warning("%s doesn't cover .env.example (%s)", env_path, plan.env.describe())
 
     docker.ensure_daemon_running(docker_host=docker_host)
     settings = load_settings(env_file)
@@ -346,6 +361,11 @@ def deploy(
     verified, probe_result = _wait_for_http(host)
     log.info("probe: %s%s", probe_result, "" if verified else " (gave up waiting)")
 
+    health = health_mod.run(record, client=client, account_id=account_id)
+    health.add("http", verified, probe_result)
+    if not health.ok:
+        log.warning("deployment is not fully healthy:\n%s", health.failures())
+
     return DeployResult(
         slug=plan.slug,
         fqdn=host,
@@ -359,6 +379,7 @@ def deploy(
         ),
         verified=verified,
         probe=probe_result,
+        health=health,
     )
 
 
@@ -466,3 +487,33 @@ def status(slug: str | None = None, *, probe: bool = True) -> list[StatusResult]
         )
 
     return [one(record) for record in sorted(records, key=lambda r: r.slug)]
+
+
+
+def verify(
+    slug: str, *, env_file: str | Path | None = None, probe: bool = True
+) -> HealthReport:
+    """Run every health check on a deployed SLUG and report each result:
+    project .env, both containers, the tunnel's connections, the ingress rule,
+    the DNS record and a live HTTP request. Changes nothing.
+
+    Needs the Cloudflare token for the tunnel, ingress and DNS checks. Without
+    one (or with no .env), those are skipped and a `cloudflare` check says so.
+    """
+    record = StateStore().require(slug)
+    client = account_id = None
+    skipped = ""
+    try:
+        settings = load_settings(env_file)
+        client = _client(settings)
+        account_id = settings.account_id or client.resolve_account_id()
+    except PortalError as exc:
+        client = None
+        skipped = str(exc)
+    report = health_mod.run(record, client=client, account_id=account_id)
+    if client is None:
+        report.add("cloudflare", False, f"tunnel, ingress and DNS not checked: {skipped}")
+    if probe:
+        result = _probe(record.fqdn)
+        report.add("http", _app_answered(result), result)
+    return report

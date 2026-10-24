@@ -12,6 +12,11 @@ from . import api
 from .errors import PortalError
 
 
+def _print_checks(checks) -> None:
+    for c in checks:
+        print(f"{'ok' if c.ok else 'FAIL':4}  {c.name:11} {c.detail}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m portal")
     parser.add_argument("-v", "--verbose", action="store_true", help="show progress")
@@ -29,6 +34,12 @@ def main(argv: list[str] | None = None) -> int:
         help="run containers on a remote docker daemon, e.g. ssh://user@1.2.3.4",
     )
 
+    p_deploy.add_argument(
+        "--allow-missing-env",
+        action="store_true",
+        help="warn instead of failing when .env lacks keys from .env.example",
+    )
+
     p_destroy = sub.add_parser("destroy", help="tear down a deployment")
     p_destroy.add_argument("slug")
     p_destroy.add_argument("--volumes", action="store_true")
@@ -39,6 +50,10 @@ def main(argv: list[str] | None = None) -> int:
     p_status = sub.add_parser("status", help="report what portal has deployed")
     p_status.add_argument("slug", nargs="?", default=None)
     p_status.add_argument("--no-probe", action="store_true")
+
+    p_verify = sub.add_parser("verify", help="health-check a deployment, read-only")
+    p_verify.add_argument("slug")
+    p_verify.add_argument("--no-probe", action="store_true")
 
     p_check = sub.add_parser("check", help="check the Cloudflare token, read-only")
     p_check.add_argument("--host", default=None, help="also check zone and DNS access for it")
@@ -62,8 +77,12 @@ def main(argv: list[str] | None = None) -> int:
                 service=args.service,
                 name=args.name,
                 docker_host=args.docker_host,
+                strict_env=not args.allow_missing_env,
             )
             print(f"live at {result.live_url}  ({result.probe})")
+            _print_checks(result.health.checks)
+            if not result.health.ok:
+                return 1
         elif args.command == "destroy":
             result = api.destroy(args.slug, volumes=args.volumes, docker_host=args.docker_host)
             if result.state_removed:
@@ -74,10 +93,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "status":
             for r in api.status(args.slug, probe=not args.no_probe):
                 print(f"{r.record.slug}  https://{r.record.fqdn}  {r.probe or ''}")
+        elif args.command == "verify":
+            report = api.verify(args.slug, probe=not args.no_probe)
+            _print_checks(report.checks)
+            if not report.ok:
+                return 1
         elif args.command == "check":
             report = api.check(args.host)
-            for c in report.checks:
-                print(f"{'ok' if c.ok else 'FAIL':4}  {c.name:8} {c.detail}")
+            _print_checks(report.checks)
             if not report.ok:
                 return 1
         elif args.command == "inspect":
