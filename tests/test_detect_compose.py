@@ -70,7 +70,7 @@ def test_ambiguous_services_raise_with_candidates():
     data = _compose(
         "services:\n  api: {build: ./a}\n  web: {build: ./w}\n"
     )
-    with pytest.raises(DetectionError, match="--service"):
+    with pytest.raises(DetectionError, match="service="):
         pick_service(data)
 
 
@@ -118,3 +118,15 @@ def test_load_compose_rejects_serviceless_file(tmp_path):
     f.write_text("version: '3'\n")
     with pytest.raises(DetectionError, match="no services"):
         load_compose(f)
+
+
+def test_detect_rejects_network_mode_service(tmp_path):
+    (tmp_path / "compose.yml").write_text(
+        "services:\n  app:\n    image: x\n    network_mode: host\n    expose: ['80']\n"
+    )
+    with pytest.raises(DetectionError, match="network_mode"):
+        detect(tmp_path)
+
+
+def test_detect_name_overrides_slug(fixtures_dir):
+    assert detect(fixtures_dir / "simple_dockerfile", name="My App").slug == "my-app"

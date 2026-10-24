@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +19,10 @@ from ..config import state_path
 from ..errors import StateError
 
 SCHEMA_VERSION = 1
+LOCK_TIMEOUT = 15.0
+# A lock older than this is from a process that died mid-write; holding the
+# lock only spans one read-modify-write, which takes milliseconds.
+LOCK_STALE_AFTER = 60.0
 
 
 @dataclass
@@ -102,18 +108,54 @@ class StateStore:
         if record is None:
             raise StateError(
                 f"No deployment named '{slug}' in {self.path}. "
-                f"Run `portal status` to see what portal knows about."
+                f"status() lists what portal knows about."
             )
         return record
 
+    @contextmanager
+    def _locked(self):
+        """Serialize read-modify-write across processes, so two deploys running
+        at once can't each load the file, add their entry, and have the second
+        write drop the first. A lockfile created with O_EXCL works the same on
+        POSIX and Windows."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock = self.path.with_name(self.path.name + ".lock")
+        deadline = time.monotonic() + LOCK_TIMEOUT
+        while True:
+            try:
+                os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+                break
+            except FileExistsError:
+                try:
+                    if time.time() - lock.stat().st_mtime > LOCK_STALE_AFTER:
+                        lock.unlink()
+                        continue
+                except FileNotFoundError:
+                    continue
+                if time.monotonic() > deadline:
+                    raise StateError(
+                        f"Timed out waiting for {lock}. If no other portal process "
+                        f"is running, delete that file."
+                    ) from None
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            try:
+                lock.unlink()
+            except FileNotFoundError:
+                pass
+
     def put(self, record: ProjectRecord) -> None:
-        data = self._load_raw()
-        data["projects"][record.slug] = record.to_dict()
-        self._write_raw(data)
+        with self._locked():
+            data = self._load_raw()
+            data["projects"][record.slug] = record.to_dict()
+            self._write_raw(data)
 
     def delete(self, slug: str) -> bool:
-        data = self._load_raw()
-        existed = data["projects"].pop(slug, None) is not None
-        if existed:
-            self._write_raw(data)
-        return existed
+        with self._locked():
+            data = self._load_raw()
+            existed = data["projects"].pop(slug, None) is not None
+            if existed:
+                self._write_raw(data)
+            return existed

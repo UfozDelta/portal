@@ -70,10 +70,16 @@ def test_synthesized_compose_points_at_source_dir(fixtures_dir):
 
 def test_candidate_zones_longest_suffix_first():
     assert candidate_zones("app.staging.example.com") == [
+        "app.staging.example.com",
         "staging.example.com",
         "example.com",
         "com",
     ]
+
+
+def test_candidate_zones_includes_the_apex_itself():
+    # deploying straight to a zone apex must find that zone
+    assert candidate_zones("example.com")[0] == "example.com"
 
 
 def test_ownership_comment_matching():

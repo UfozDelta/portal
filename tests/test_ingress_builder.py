@@ -9,7 +9,6 @@ from portal.cloudflare.ingress import (
     CATCH_ALL,
     build_config,
     build_ingress,
-    empty_config,
     is_catch_all,
     validate_ingress,
 )
@@ -51,12 +50,6 @@ def test_build_config_shape():
     config = build_config(HOST, ORIGIN)
     assert set(config) == {"config"}
     assert config["config"]["ingress"] == build_ingress(HOST, ORIGIN)
-
-
-def test_empty_config_is_only_the_catch_all():
-    rules = empty_config()["config"]["ingress"]
-    assert rules == [{"service": "http_status:404"}]
-    validate_ingress(rules)
 
 
 def test_build_ingress_requires_hostname_and_origin():

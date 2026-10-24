@@ -32,12 +32,6 @@ def build_config(hostname: str, origin_url: str) -> dict:
     return {"config": {"ingress": build_ingress(hostname, origin_url)}}
 
 
-def empty_config() -> dict:
-    """Ingress stripped back to nothing but the catch-all — used when tearing a
-    tunnel's routing down without deleting the tunnel."""
-    return {"config": {"ingress": [dict(CATCH_ALL)]}}
-
-
 def validate_ingress(rules: list[dict]) -> None:
     """Guard the invariants before anything is sent to Cloudflare."""
     if not rules:

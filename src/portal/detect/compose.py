@@ -82,7 +82,7 @@ class ServiceChoice:
 def pick_service(compose: dict, requested: str | None = None) -> ServiceChoice:
     """Choose the web-facing service.
 
-    Order: an explicit --service wins; a single service is trivial; otherwise
+    Order: an explicit service= wins; a single service is trivial; otherwise
     drop known infra, then prefer services that both `build:` and carry a
     web-ish name, then a web-ish name, then anything with `build:`.
     """
@@ -104,7 +104,7 @@ def pick_service(compose: dict, requested: str | None = None) -> ServiceChoice:
     if not candidates:
         raise DetectionError(
             "Every service in the compose file looks like infrastructure "
-            "(database, cache, proxy). Name the one to expose with --service."
+            "(database, cache, proxy). Name the one to expose with service=."
         )
     if len(candidates) == 1:
         return ServiceChoice(candidates[0], services[candidates[0]] or {}, candidates)
@@ -130,7 +130,7 @@ def pick_service(compose: dict, requested: str | None = None) -> ServiceChoice:
     raise DetectionError(
         "Could not tell which service to expose. Candidates: "
         + ", ".join(sorted(candidates))
-        + ". Pick one with --service."
+        + ". Pick one with service=."
     )
 
 

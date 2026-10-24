@@ -63,7 +63,8 @@ If a call fails asking for a token, the user needs a `.env` in the portal repo r
 ## Status / destroy
 
 - `python -c "from portal.api import status; [print(r) for r in status()]"` — read-only, safe to run anytime, no confirmation needed.
-- `python -c "from portal.api import destroy; print(destroy('<slug>'))"` — deletes real cloud resources (DNS record, tunnel, containers). Always show the user what will be torn down and get explicit confirmation before calling it — there is no built-in prompt to lean on anymore. Never chain this after a deploy in the same breath without the user asking for it. You don't need to pass `docker_host` here — destroy() reuses whatever host that slug was deployed to.
+- `python -c "from portal.api import destroy; print(destroy('<slug>'))"` — deletes real cloud resources (DNS record, tunnel, containers). Always show the user what will be torn down and get explicit confirmation before calling it — there is no built-in prompt to lean on anymore. Never chain this after a deploy in the same breath without the user asking for it. You don't need to pass `docker_host` here — destroy() reuses whatever host that slug was deployed to. If the result has `state_removed=False`, a DNS or tunnel deletion failed and the state entry was kept on purpose — report the warning and offer to run destroy again; don't clean up by hand.
+- A deploy that raised partway still left a state entry, so the same `destroy('<slug>')` cleans it up.
 
 ## Boundaries
 

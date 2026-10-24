@@ -1,8 +1,8 @@
 """Minimal Cloudflare API v4 client.
 
-Not covered by automated tests in this phase — it would need either live
-credentials or an HTTP mock; the surface is small and the interesting logic
-(ingress rule building, zone matching) lives in pure functions that ARE tested.
+Only exercised by the live test suite (`pytest -m live`). The surface is small,
+and the interesting logic (ingress rule building, zone matching) lives in pure
+functions that are unit-tested.
 """
 
 from __future__ import annotations
@@ -76,7 +76,8 @@ class CloudflareClient:
         except ValueError:
             raise CloudflareError(
                 f"{method} {path} returned HTTP {resp.status_code} with a "
-                f"non-JSON body: {self._scrub(resp.text[:300])}"
+                f"non-JSON body: {self._scrub(resp.text[:300])}",
+                status_code=resp.status_code,
             ) from None
 
         if not body.get("success", False):
@@ -85,7 +86,8 @@ class CloudflareClient:
                 for e in body.get("errors") or []
             ) or f"HTTP {resp.status_code}"
             raise CloudflareError(
-                f"Cloudflare rejected {method} {path}: {self._scrub(messages)}"
+                f"Cloudflare rejected {method} {path}: {self._scrub(messages)}",
+                status_code=resp.status_code,
             )
         return body
 

@@ -47,7 +47,7 @@ def test_detect_fails_without_dockerfile_or_compose(tmp_path):
 
 def test_detect_fails_when_no_port_discoverable(tmp_path):
     (tmp_path / "Dockerfile").write_text("FROM scratch\nCMD [\"/x\"]\n")
-    with pytest.raises(DetectionError, match="--port"):
+    with pytest.raises(DetectionError, match="port="):
         detect(tmp_path)
 
 

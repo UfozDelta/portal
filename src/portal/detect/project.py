@@ -84,13 +84,18 @@ def detect(
     port: int | None = None,
     service: str | None = None,
     fqdn: str | None = None,
+    name: str | None = None,
 ) -> ProjectPlan:
-    """Inspect a project directory and decide what portal would deploy."""
+    """Inspect a project directory and decide what portal would deploy.
+
+    `name` overrides the slug, which otherwise comes from the directory name —
+    needed when two projects live in directories with the same name.
+    """
     project_path = Path(path).expanduser().resolve()
     if not project_path.is_dir():
         raise DetectionError(f"{project_path} is not a directory.")
 
-    slug = slugify(project_path.name)
+    slug = slugify(name or project_path.name)
     env_report = check_env(project_path)
     dockerfile = project_path / DOCKERFILE_NAME
     dockerfile = dockerfile if dockerfile.is_file() else None
@@ -99,6 +104,14 @@ def detect(
     if compose_file is not None:
         data = compose_mod.load_compose(compose_file)
         choice = compose_mod.pick_service(data, service)
+        network_mode = choice.spec.get("network_mode")
+        if network_mode:
+            raise DetectionError(
+                f"Service '{choice.name}' uses network_mode: {network_mode}. portal "
+                f"reaches the app by attaching it to a private network, which "
+                f"compose does not allow alongside network_mode. Remove "
+                f"network_mode, or pick another service with service=."
+            )
         resolved_port, source = _resolve_port(
             flag_port=port,
             compose_ports=compose_mod.service_ports(choice.spec),
@@ -127,7 +140,7 @@ def detect(
 
     if service and service != "app":
         raise DetectionError(
-            "--service only applies to compose projects; this project is a bare "
+            "service= only applies to compose projects; this project is a bare "
             "Dockerfile, whose synthesized service is always named 'app'."
         )
 
@@ -168,7 +181,7 @@ def _service_dockerfile(
 def _resolve_port(
     *, flag_port: int | None, compose_ports: list[int], dockerfile: Path | None
 ) -> tuple[int, str]:
-    """--port > compose expose/ports > Dockerfile EXPOSE > a clear error."""
+    """port= > compose expose/ports > Dockerfile EXPOSE > a clear error."""
     if flag_port is not None:
         return flag_port, "flag"
     if compose_ports:
@@ -179,5 +192,5 @@ def _resolve_port(
             return exposed[0], "dockerfile"
     raise DetectionError(
         "Could not determine which port the app listens on. Nothing declares it "
-        "(no compose expose:/ports:, no Dockerfile EXPOSE). Pass --port N."
+        "(no compose expose:/ports:, no Dockerfile EXPOSE). Pass port=N."
     )

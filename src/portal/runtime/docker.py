@@ -7,9 +7,8 @@ every command here runs against a remote machine's docker with no portal
 install needed there: only `docker` (client-side) and `ssh` on PATH locally,
 and `docker` + sshd reachable on the remote end.
 
-Not covered by automated tests in this phase: exercising these paths needs a
-live docker daemon. The boundary is deliberately narrow (one `run` function) so
-a later phase can mock it in one place.
+Not unit-tested: exercising these paths needs a live docker daemon. The
+mocked deploy tests stub this module at its function boundary instead.
 """
 
 from __future__ import annotations
@@ -20,6 +19,14 @@ import subprocess
 from pathlib import Path
 
 from ..errors import DockerError
+
+# Pinned so an upstream release can't silently break every deploy. Bump
+# deliberately; PORTAL_CLOUDFLARED_IMAGE overrides it without a code change.
+CLOUDFLARED_IMAGE = "cloudflare/cloudflared:2026.9.3"
+
+
+def cloudflared_image() -> str:
+    return os.environ.get("PORTAL_CLOUDFLARED_IMAGE") or CLOUDFLARED_IMAGE
 
 
 def _require_docker() -> str:
@@ -178,7 +185,7 @@ def run_cloudflared(
             "portal.managed=true",
             "--env",
             "TUNNEL_TOKEN",
-            "cloudflare/cloudflared:latest",
+            cloudflared_image(),
             "tunnel",
             "--no-autoupdate",
             "run",

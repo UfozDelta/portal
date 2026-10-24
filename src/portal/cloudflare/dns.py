@@ -7,7 +7,7 @@ that stamp, so a hand-made record is never clobbered.
 
 from __future__ import annotations
 
-from ..errors import CloudflareError
+from ..errors import CloudflareError, OwnershipError
 
 
 def ownership_comment(slug: str) -> str:
@@ -21,11 +21,14 @@ def is_portal_owned(record: dict, slug: str) -> bool:
 def candidate_zones(fqdn: str) -> list[str]:
     """Suffixes of the hostname that could be a zone, longest first.
 
-    app.staging.example.com -> staging.example.com, example.com, com
-    (the single-label tail is never a zone in practice but costs one lookup).
+    app.staging.example.com -> app.staging.example.com, staging.example.com,
+    example.com, com. The full name comes first because the hostname can be a
+    zone apex itself (deploying straight to example.com, or to a delegated
+    subzone). The single-label tail is never a zone in practice but costs one
+    lookup.
     """
     labels = fqdn.strip(".").split(".")
-    return [".".join(labels[i:]) for i in range(1, len(labels))] or [fqdn]
+    return [".".join(labels[i:]) for i in range(len(labels))]
 
 
 def resolve_zone(client, fqdn: str) -> dict:
@@ -71,7 +74,7 @@ def upsert_cname(client, zone_id: str, fqdn: str, tunnel_id: str, slug: str) -> 
         return client.post(f"/zones/{zone_id}/dns_records", json=payload)["result"]["id"]
 
     if not is_portal_owned(existing, slug):
-        raise CloudflareError(
+        raise OwnershipError(
             f"A DNS record for {fqdn} already exists ({existing.get('type')} -> "
             f"{existing.get('content')}) and is not marked as managed by "
             f"portal:{slug}. Refusing to overwrite it. Remove it by hand, or "
@@ -87,11 +90,15 @@ def delete_record(client, zone_id: str, record_id: str, slug: str) -> bool:
     """Delete only if the record still carries this slug's ownership stamp."""
     try:
         record = client.get(f"/zones/{zone_id}/dns_records/{record_id}")["result"]
-    except CloudflareError:
-        return False  # already gone
+    except CloudflareError as exc:
+        # Only a 404 means "already gone". Anything else (auth, network, 5xx)
+        # is a real failure and must not be reported as a clean removal.
+        if exc.status_code == 404:
+            return False
+        raise
 
     if not is_portal_owned(record, slug):
-        raise CloudflareError(
+        raise OwnershipError(
             f"DNS record {record.get('name')} is no longer marked as managed by "
             f"portal:{slug}. Refusing to delete it; remove it by hand if you "
             f"really want it gone."

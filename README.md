@@ -47,6 +47,14 @@ up from the current directory. To use a different file, set `PORTAL_ENV_FILE`
 or pass `env_file=` to `deploy()` or `destroy()`. `status()` and `inspect()`
 don't need the token at all.
 
+A few optional environment variables change portal's own behavior:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `PORTAL_ENV_FILE` | nearest `.env` | Which file to read the token from |
+| `PORTAL_HOME` | `~/.portal` | Where state and generated compose files live |
+| `PORTAL_CLOUDFLARED_IMAGE` | a pinned `cloudflare/cloudflared` tag | Sidecar image to run |
+
 This `.env` belongs to portal. It has nothing to do with the `.env` of the
 project you're deploying. portal never reads that file's values: it passes the
 path to `docker compose --env-file`, and it only looks at which key names from
@@ -67,19 +75,46 @@ destroy("myapp")                        # DNS record, tunnel, containers, state 
 ```
 
 `deploy()` also accepts `port=` and `service=` for cases where detection
-guesses wrong or the compose file has several candidate services.
+guesses wrong or the compose file has several candidate services. The
+deployment's name (its slug) comes from the directory name. Pass `name=` to
+pick another one. portal refuses to deploy a second directory under a name
+that's already taken by a different path.
+
+`host` has to be a bare hostname such as `app.example.com` or `example.com`,
+with no scheme, port, or path.
 
 None of these calls ask for confirmation. `deploy()` creates real Cloudflare
 resources and `destroy()` deletes them, so if a human needs to approve that
 first, the caller has to handle it. Failures raise `PortalError` with a message
 you can show to a person as-is.
 
+portal logs progress to the `portal` logger. Call
+`logging.basicConfig(level=logging.INFO)` to watch a deploy step by step.
+Warnings, such as keys from the project's `.env.example` that are missing from
+its `.env`, show up even without that.
+
+### From the shell
+
+The same four calls are available as a thin command-line wrapper:
+
+```bash
+python -m portal -v deploy ~/code/myapp --host app.example.com
+python -m portal inspect ~/code/myapp
+python -m portal status
+python -m portal destroy myapp
+```
+
+`deploy` and `inspect` take `--port`, `--service`, and `--name`. `deploy` also
+takes `--docker-host`. `destroy` exits with status 1 if cleanup was only
+partial.
+
 <p align="center"><img src="docs/flow.svg" alt="deploy() flow: detect, docker up, wait, tunnel, ingress, DNS, curl-verify" width="720"></p>
 
 ## What deploy() does
 
 1. **Detect.** Finds the compose file, or a bare Dockerfile, and picks the
-   service to expose.
+   service to expose. A service using `network_mode` is rejected, because
+   compose can't attach it to portal's network.
 2. **Start the app.** Runs `docker compose -p portal-<slug> -f <yours> -f
    <override> up -d --build`. portal never edits your compose file. It adds an
    override on top that sets a fixed `container_name`, joins the service to a
@@ -100,31 +135,38 @@ you can show to a person as-is.
 4. **Create the tunnel.** portal creates a tunnel named `portal-<slug>`, or
    reuses it if it already exists. The tunnel uses `config_src: cloudflare`, so
    its ingress rules are managed through the API instead of a local config file.
-5. **Start the sidecar.** Runs `cloudflare/cloudflared:latest` as
-   `portal-<slug>-cloudflared` on the same network. The tunnel token is passed
+5. **Start the sidecar.** Runs a pinned `cloudflare/cloudflared` image as
+   `portal-<slug>-cloudflared` on the same network. Set
+   `PORTAL_CLOUDFLARED_IMAGE` to use a different one. The tunnel token is passed
    to it through the environment, so it never appears in the `docker run`
    arguments.
 6. **Set ingress.** One rule for the hostname, followed by the required
    `http_status:404` catch-all.
-7. **Point DNS.** portal finds the zone by trying each parent domain of the
-   hostname, longest first. It then creates or updates a proxied CNAME to
-   `<tunnel-id>.cfargotunnel.com` with the comment `managed by
-   portal:<slug>`. If a record already exists for that name without this exact
+7. **Point DNS.** portal finds the zone by trying the hostname and then each
+   parent domain, longest first, so a zone apex works too. It then creates or
+   updates a proxied CNAME to `<tunnel-id>.cfargotunnel.com` with the comment
+   `managed by portal:<slug>`. If a record already exists for that name without this exact
    comment, portal refuses to change it. `destroy()` follows the same rule
-   before deleting a record.
+   before deleting a record. If you redeploy a project under a new hostname,
+   portal deletes the old record.
 8. **Verify.** portal requests `https://<host>` every 3 seconds for up to a
    minute. A new tunnel and DNS record often take a few seconds before they
    route traffic, so a single check right after setup would usually fail even
-   when everything is fine. Any HTTP response counts as success, including an
-   error status from Cloudflare's edge. Check `probe` for the actual status, not
-   just `verified`. If the minute runs out, `deploy()` still returns normally,
-   with `verified=False`.
-9. **Record.** Writes the deployment to `~/.portal/state.json`. The file
-   contains IDs and paths, never secrets.
+   when everything is fine. Any response from the app counts as success, error
+   statuses included. The statuses Cloudflare's edge produces when it can't
+   reach the app (502, 504, 520–530) don't count, and portal keeps polling.
+   If the minute runs out, `deploy()` still returns normally, with
+   `verified=False`. `probe` has the last status.
 
-`destroy()` runs these steps in reverse. If removing the DNS record or deleting
-the tunnel fails, it logs a warning and continues, so a Cloudflare problem
-never leaves containers running with no record of them.
+The deployment is recorded in `~/.portal/state.json` as each resource is
+created, not only at the end. A deploy that fails halfway can still be cleaned
+up with `destroy()`. The file contains IDs and paths, never secrets.
+
+`destroy()` runs these steps in reverse. It stops the `cloudflared` sidecar
+before deleting the tunnel, because Cloudflare won't delete a tunnel that
+still has connections. If deleting the DNS record or the tunnel fails, it logs a
+warning and still removes the containers. It also keeps the state entry
+(`state_removed=False`), so calling `destroy()` again finishes the cleanup.
 
 ## Remote hosts over SSH
 
@@ -191,9 +233,14 @@ that machine. Run portal on the remote machine itself and leave out
 
 ## Scope
 
-portal deploys one project per call and assumes things go right. It has no
-drift detection, no rollback, no background daemon, and no shared tunnels.
-`status()` only reports problems and never fixes anything.
+portal deploys one project per call. It has no drift detection, no automatic
+rollback, no background daemon, and no shared tunnels. A failed deploy isn't
+undone, but it is recorded, so `destroy()` can clean it up. `status()` only
+reports problems and never fixes anything.
+
+portal doesn't write Dockerfiles. The project has to already have a Dockerfile
+or a compose file. Working out how to containerize a project is a separate
+problem, and keeping it out is what keeps portal small.
 
 ## Tests
 
@@ -202,11 +249,13 @@ pip install -e ".[dev]"
 pytest
 ```
 
-The tests cover project detection, ingress rule building, the state store,
-the compose override and synthesized compose files, the DNS ownership checks,
-the docker environment handling for `docker_host`, `.env` loading, and the
-full `deploy()`/`status()`/`destroy()` orchestration with docker and
-Cloudflare stubbed out. None of this touches a real Docker daemon or the
+The tests cover project detection, ingress rule building, the state store and
+its lock, the compose override and synthesized compose files, zone lookup and
+the DNS ownership checks, the docker environment handling for `docker_host`,
+`.env` loading, and the full `deploy()`/`status()`/`destroy()` orchestration
+with docker and Cloudflare stubbed out. The orchestration tests include
+half-finished deploys, redeploys to a new hostname, name collisions, and
+partial teardowns. None of this touches a real Docker daemon or the
 Cloudflare API, so `pytest` needs no credentials.
 
 To actually verify a token against the live Cloudflare API — creates a

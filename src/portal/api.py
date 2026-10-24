@@ -11,8 +11,9 @@ that is not yet routing. destroy() unwinds in the opposite order.
 from __future__ import annotations
 
 import logging
+import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import requests
@@ -21,9 +22,9 @@ from .cloudflare import dns as dns_mod
 from .cloudflare import ingress as ingress_mod
 from .cloudflare import tunnels as tunnel_mod
 from .cloudflare.client import CloudflareClient
-from .config import Paths
+from .config import project_dir
 from .detect import ProjectPlan, detect
-from .errors import DockerError, PortalError
+from .errors import DockerError, OwnershipError, PortalError
 from .runtime import docker, override
 from .settings import Settings, load_settings
 from .state import ProjectRecord, StateStore
@@ -60,6 +61,9 @@ class DestroyResult:
     slug: str
     dns_removed: bool
     tunnel_deleted: bool
+    # False when a DNS or tunnel deletion failed for a retryable reason; the
+    # state entry is kept so calling destroy() again finishes the job.
+    state_removed: bool
 
 
 @dataclass(frozen=True)
@@ -78,31 +82,70 @@ def _account_id(client: CloudflareClient, settings: Settings) -> str:
     return settings.account_id or client.resolve_account_id()
 
 
-def _compose_files(plan: ProjectPlan, paths: Paths) -> tuple[list[Path], Path]:
+def _compose_files(plan: ProjectPlan) -> list[Path]:
     """The -f chain: base compose (project's own, or synthesized) then override."""
+    work = project_dir(plan.slug)
     if plan.compose_file is not None:
         base = plan.compose_file
     else:
         base = override.write_yaml(
-            override.synthesize_compose(plan), paths.work / "compose.generated.yml"
+            override.synthesize_compose(plan), work / "compose.generated.yml"
         )
     override_file = override.write_yaml(
-        override.build_override(plan), paths.work / "compose.override.yml"
+        override.build_override(plan), work / "compose.override.yml"
     )
-    return [base, override_file], override_file
+    return [base, override_file]
 
 
-def inspect(path: str, *, port: int | None = None, service: str | None = None) -> ProjectPlan:
+def inspect(
+    path: str,
+    *,
+    port: int | None = None,
+    service: str | None = None,
+    name: str | None = None,
+) -> ProjectPlan:
     """What deploy() would do, with no side effects."""
-    return detect(path, port=port, service=service)
+    return detect(path, port=port, service=service, name=name)
+
+
+_HOST_LABEL = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
+
+
+def _normalize_host(host: str) -> str:
+    """A bare hostname, lowercased. Rejects schemes, ports and paths up front,
+    instead of letting them surface later as a confusing zone-lookup error."""
+    h = host.strip().lower().rstrip(".")
+    labels = h.split(".")
+    if len(labels) < 2 or len(h) > 253 or not all(_HOST_LABEL.match(l) for l in labels):
+        raise PortalError(
+            f"'{host}' is not a bare hostname. Pass something like "
+            f"app.example.com, with no scheme, port or path."
+        )
+    return h
+
+
+# Statuses Cloudflare's edge generates itself when it can't reach the app
+# through the tunnel (530/1033: no connector; 502: connector can't reach the
+# origin). Seeing one means the deploy is not working yet, not that the app
+# answered.
+EDGE_ERROR_STATUSES = frozenset({502, 504, *range(520, 531)})
+_HTTP_STATUS = re.compile(r"^HTTP (\d+)")
 
 
 def _probe(fqdn: str) -> str:
     try:
         resp = requests.get(f"https://{fqdn}", timeout=10, allow_redirects=False)
-        return f"HTTP {resp.status_code}"
     except requests.RequestException as exc:
         return f"unreachable ({type(exc).__name__})"
+    code = resp.status_code
+    if code in EDGE_ERROR_STATUSES:
+        return f"HTTP {code} (Cloudflare could not reach the app through the tunnel)"
+    return f"HTTP {code}"
+
+
+def _app_answered(probe: str) -> bool:
+    match = _HTTP_STATUS.match(probe)
+    return bool(match) and int(match.group(1)) not in EDGE_ERROR_STATUSES
 
 
 def _wait_for_container(
@@ -133,7 +176,7 @@ def _wait_for_http(fqdn: str, *, timeout: float = 60, interval: float = 3) -> tu
     result = "not checked"
     while time.monotonic() < deadline:
         result = _probe(fqdn)
-        if result.startswith("HTTP"):
+        if _app_answered(result):
             return True, result
         time.sleep(interval)
     return False, result
@@ -145,31 +188,71 @@ def deploy(
     *,
     port: int | None = None,
     service: str | None = None,
+    name: str | None = None,
     env_file: str | Path | None = None,
     docker_host: str | None = None,
 ) -> DeployResult:
     """Deploy PATH and publish it at HOST. Creates real Cloudflare resources
     and starts containers — no confirmation prompt, the caller owns that.
 
+    `name` sets the deployment's slug; it defaults to the directory name.
+
     `docker_host`, e.g. "ssh://user@1.2.3.4", targets a remote docker daemon
     over SSH instead of the local one. The project directory at PATH is still
     read locally (portal, not the remote box, needs the compose/Dockerfile);
     only the container runtime moves. Requires `ssh` on PATH locally and
     key-based access to a docker-capable account on the remote host.
+
+    State is saved as each resource is created, not only at the end, so a
+    deploy that fails halfway can still be cleaned up with destroy().
     """
-    plan = detect(path, port=port, service=service, fqdn=host)
+    host = _normalize_host(host)
+    plan = detect(path, port=port, service=service, fqdn=host, name=name)
+    store = StateStore()
+    previous = store.get(plan.slug)
+    if previous and Path(previous.source_path) != plan.source_path:
+        raise PortalError(
+            f"A deployment named '{plan.slug}' already exists for "
+            f"{previous.source_path}. Pass name= to deploy {plan.source_path} "
+            f"under a different name, or destroy('{plan.slug}') first."
+        )
+    if plan.env.missing_keys:
+        log.warning(
+            "%s is missing keys listed in .env.example: %s",
+            plan.source_path / ".env",
+            ", ".join(plan.env.missing_keys),
+        )
+
     docker.ensure_daemon_running(docker_host=docker_host)
     settings = load_settings(env_file)
     client = _client(settings)
     account_id = _account_id(client, settings)
-    store = StateStore()
 
-    paths = Paths.for_slug(plan.slug)
+    files = _compose_files(plan)
+
+    # Until the new DNS record exists, keep tracking the previous one (on a
+    # redeploy), so a failure in between never loses track of it.
+    record = ProjectRecord(
+        slug=plan.slug,
+        source_path=str(plan.source_path),
+        compose_file=str(files[0]),
+        override_file=str(files[1]),
+        service=plan.service,
+        container_name=plan.container_name,
+        port=plan.port,
+        fqdn=previous.fqdn if previous else host,
+        tunnel_id=previous.tunnel_id if previous else "",
+        zone_id=previous.zone_id if previous else "",
+        dns_record_id=previous.dns_record_id if previous else "",
+        network=plan.network,
+        cloudflared_container=plan.cloudflared_container,
+        docker_host=docker_host or "",
+    )
+    store.put(record)
 
     log.info("network %s", plan.network)
     docker.ensure_network(plan.network, docker_host=docker_host)
 
-    files, override_file = _compose_files(plan, paths)
     log.info("docker compose up (%s)", plan.compose_project)
     env_path = plan.source_path / ".env"
     docker.compose_up(
@@ -190,7 +273,9 @@ def deploy(
         tunnel = tunnel_mod.create_tunnel(client, account_id, plan.slug)
         log.info("created tunnel %s", tunnel["id"])
     tunnel_id = tunnel["id"]
-    tunnel_token = tunnel_mod.get_tunnel_token(client, account_id, tunnel_id)
+    record = replace(record, tunnel_id=tunnel_id)
+    store.put(record)
+    tunnel_token =tunnel_mod.get_tunnel_token(client, account_id, tunnel_id)
 
     log.info("starting %s", plan.cloudflared_container)
     docker.run_cloudflared(
@@ -211,28 +296,25 @@ def deploy(
     record_id = dns_mod.upsert_cname(client, zone["id"], host, tunnel_id, plan.slug)
     log.info("CNAME %s -> %s (proxied)", host, dns_mod.tunnel_target(tunnel_id))
 
+    if previous and previous.dns_record_id and previous.dns_record_id != record_id:
+        # Redeployed under a new hostname: the old CNAME still points at this
+        # tunnel, whose ingress no longer routes it, so it would only 404.
+        try:
+            dns_mod.delete_record(client, previous.zone_id, previous.dns_record_id, plan.slug)
+            log.info("removed old DNS record for %s", previous.fqdn)
+        except PortalError as exc:
+            log.warning(
+                "could not remove the old DNS record for %s, remove it by hand: %s",
+                previous.fqdn,
+                exc,
+            )
+
+    record = replace(record, fqdn=host, zone_id=zone["id"], dns_record_id=record_id)
+    store.put(record)
+
     log.info("curling https://%s until it answers", host)
     verified, probe_result = _wait_for_http(host)
     log.info("probe: %s%s", probe_result, "" if verified else " (gave up waiting)")
-
-    store.put(
-        ProjectRecord(
-            slug=plan.slug,
-            source_path=str(plan.source_path),
-            compose_file=str(files[0]),
-            override_file=str(override_file),
-            service=plan.service,
-            container_name=plan.container_name,
-            port=plan.port,
-            fqdn=host,
-            tunnel_id=tunnel_id,
-            zone_id=zone["id"],
-            dns_record_id=record_id,
-            network=plan.network,
-            cloudflared_container=plan.cloudflared_container,
-            docker_host=docker_host or "",
-        )
-    )
 
     return DeployResult(
         slug=plan.slug,
@@ -269,28 +351,43 @@ def destroy(
     docker_host = docker_host if docker_host is not None else (record.docker_host or None)
     settings = load_settings(env_file)
     client = _client(settings)
+    # Cleared when a Cloudflare deletion fails for a reason a retry could fix.
+    # Containers are torn down regardless (a Cloudflare problem must not strand
+    # them), but the state entry is kept so the leftover is never forgotten.
+    complete = True
 
     dns_removed = False
-    try:
-        dns_removed = dns_mod.delete_record(
-            client, record.zone_id, record.dns_record_id, slug
-        )
-        log.info("DNS record %s", "deleted" if dns_removed else "already gone")
-    except PortalError as exc:
-        # A refused delete must not strand the containers: report and carry on.
-        log.warning("DNS: %s", exc)
+    if record.dns_record_id:
+        try:
+            dns_removed = dns_mod.delete_record(
+                client, record.zone_id, record.dns_record_id, slug
+            )
+            log.info("DNS record %s", "deleted" if dns_removed else "already gone")
+        except OwnershipError as exc:
+            # Someone else owns the record now; retrying can never change that.
+            log.warning("DNS: %s", exc)
+        except PortalError as exc:
+            log.warning("DNS: %s", exc)
+            complete = False
 
-    tunnel_deleted = False
-    try:
-        account_id = _account_id(client, settings)
-        tunnel_mod.delete_tunnel(client, account_id, record.tunnel_id)
-        tunnel_deleted = True
-        log.info("tunnel %s deleted", record.tunnel_id)
-    except PortalError as exc:
-        log.warning("tunnel: %s", exc)
-
+    # The connector has to stop before the tunnel is deleted: Cloudflare
+    # refuses to delete a tunnel that still has active connections.
     docker.remove_container(record.cloudflared_container, docker_host=docker_host)
     log.info("%s removed", record.cloudflared_container)
+
+    tunnel_deleted = False
+    if record.tunnel_id:
+        try:
+            account_id = _account_id(client, settings)
+            tunnel_deleted = tunnel_mod.delete_tunnel(client, account_id, record.tunnel_id)
+            log.info(
+                "tunnel %s %s",
+                record.tunnel_id,
+                "deleted" if tunnel_deleted else "already gone",
+            )
+        except PortalError as exc:
+            log.warning("tunnel: %s", exc)
+            complete = False
 
     files = [Path(record.compose_file), Path(record.override_file)]
     docker.compose_down(
@@ -301,10 +398,23 @@ def destroy(
     )
     docker.remove_network(record.network, docker_host=docker_host)
 
-    store.delete(slug)
-    log.info("state entry for '%s' removed", slug)
+    if complete:
+        store.delete(slug)
+        log.info("state entry for '%s' removed", slug)
+    else:
+        log.warning(
+            "kept the state entry for '%s' because cleanup is incomplete; "
+            "run destroy('%s') again to finish",
+            slug,
+            slug,
+        )
 
-    return DestroyResult(slug=slug, dns_removed=dns_removed, tunnel_deleted=tunnel_deleted)
+    return DestroyResult(
+        slug=slug,
+        dns_removed=dns_removed,
+        tunnel_deleted=tunnel_deleted,
+        state_removed=complete,
+    )
 
 
 def status(slug: str | None = None, *, probe: bool = True) -> list[StatusResult]:

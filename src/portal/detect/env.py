@@ -37,10 +37,6 @@ class EnvReport:
     has_env: bool
     missing_keys: list[str]
 
-    @property
-    def ok(self) -> bool:
-        return not self.missing_keys and (self.has_env or not self.has_example)
-
 
 def check_env(project_path: Path) -> EnvReport:
     """Keys present in .env.example but absent from .env."""

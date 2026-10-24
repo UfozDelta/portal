@@ -130,3 +130,24 @@ def test_docker_host_defaults_to_local(store):
 def test_docker_host_roundtrips_for_remote_deploys(store):
     store.put(make_record(docker_host="ssh://user@1.2.3.4"))
     assert store.get("demo").docker_host == "ssh://user@1.2.3.4"
+
+
+def test_stale_lock_is_broken(tmp_path):
+    store = StateStore(tmp_path / "state.json")
+    lock = tmp_path / "state.json.lock"
+    lock.write_text("")
+    old = lock.stat().st_mtime - 3600
+    os.utime(lock, (old, old))
+    store.put(make_record())
+    assert store.get("demo") is not None
+    assert not lock.exists()
+
+
+def test_fresh_lock_times_out(tmp_path, monkeypatch):
+    from portal.state import store as store_mod
+
+    monkeypatch.setattr(store_mod, "LOCK_TIMEOUT", 0.1)
+    store = StateStore(tmp_path / "state.json")
+    (tmp_path / "state.json.lock").write_text("")
+    with pytest.raises(StateError, match="Timed out"):
+        store.put(make_record())

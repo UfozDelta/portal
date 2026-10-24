@@ -9,7 +9,12 @@ that api.deploy() wires them together correctly.
 
 from __future__ import annotations
 
+import shutil
+
+import pytest
+
 from portal import api
+from portal.errors import CloudflareError, OwnershipError, PortalError
 from portal.state import StateStore
 
 
@@ -32,7 +37,7 @@ def _mock_everything(monkeypatch, tmp_path):
     monkeypatch.setattr(
         api.tunnel_mod, "get_tunnel_token", lambda *a, **kw: "fake-tunnel-token"
     )
-    monkeypatch.setattr(api.tunnel_mod, "delete_tunnel", lambda *a, **kw: None)
+    monkeypatch.setattr(api.tunnel_mod, "delete_tunnel", lambda *a, **kw: True)
     monkeypatch.setattr(api.ingress_mod, "put_config", lambda *a, **kw: {})
     monkeypatch.setattr(
         api.dns_mod,
@@ -146,3 +151,160 @@ def test_deploy_never_verified_when_the_probe_never_answers(
     # deploy() does not raise when verification times out — it reports it.
     assert result.verified is False
     assert "unreachable" in result.probe
+
+
+def _fast_clock(monkeypatch):
+    fake_time = [0.0]
+
+    def fake_monotonic():
+        fake_time[0] += 25.0
+        return fake_time[0]
+
+    monkeypatch.setattr(api.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(api.time, "sleep", lambda _seconds: None)
+
+
+def test_cloudflare_edge_error_is_not_verified(monkeypatch, tmp_path, fixtures_dir):
+    _mock_everything(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        api, "_probe", lambda fqdn: "HTTP 530 (Cloudflare could not reach the app through the tunnel)"
+    )
+    _fast_clock(monkeypatch)
+
+    result = api.deploy(
+        str(fixtures_dir / "simple_dockerfile"), "app.example.com", env_file=_env_file(tmp_path)
+    )
+    assert result.verified is False
+    assert result.probe.startswith("HTTP 530")
+
+
+def test_app_error_status_still_counts_as_answered():
+    # the app itself answering 500 or 404 means routing works
+    assert api._app_answered("HTTP 500")
+    assert api._app_answered("HTTP 404")
+    assert not api._app_answered("HTTP 502 (Cloudflare could not reach the app through the tunnel)")
+    assert not api._app_answered("unreachable (ConnectionError)")
+
+
+@pytest.mark.parametrize(
+    "bad", ["https://app.example.com", "app.example.com/x", "app.example.com:8443", "localhost", ""]
+)
+def test_deploy_rejects_non_hostnames(monkeypatch, tmp_path, fixtures_dir, bad):
+    _mock_everything(monkeypatch, tmp_path)
+    with pytest.raises(PortalError, match="bare hostname"):
+        api.deploy(str(fixtures_dir / "simple_dockerfile"), bad, env_file=_env_file(tmp_path))
+
+
+def test_deploy_normalizes_hostname(monkeypatch, tmp_path, fixtures_dir):
+    _mock_everything(monkeypatch, tmp_path)
+    result = api.deploy(
+        str(fixtures_dir / "simple_dockerfile"), " App.Example.com. ", env_file=_env_file(tmp_path)
+    )
+    assert result.fqdn == "app.example.com"
+
+
+def test_destroy_stops_cloudflared_before_deleting_tunnel(monkeypatch, tmp_path, fixtures_dir):
+    _mock_everything(monkeypatch, tmp_path)
+    api.deploy(str(fixtures_dir / "simple_dockerfile"), "app.example.com", env_file=_env_file(tmp_path))
+
+    calls = []
+    monkeypatch.setattr(api.docker, "remove_container", lambda name, **kw: calls.append(("rm", name)))
+    monkeypatch.setattr(
+        api.tunnel_mod, "delete_tunnel", lambda *a, **kw: calls.append(("tunnel",)) or True
+    )
+    api.destroy("simple-dockerfile", env_file=_env_file(tmp_path))
+    assert calls == [("rm", "portal-simple-dockerfile-cloudflared"), ("tunnel",)]
+
+
+def test_failed_deploy_leaves_state_that_destroy_can_clean_up(monkeypatch, tmp_path, fixtures_dir):
+    _mock_everything(monkeypatch, tmp_path)
+
+    def no_zone(*a, **kw):
+        raise CloudflareError("No Cloudflare zone in this account matches")
+
+    monkeypatch.setattr(api.dns_mod, "resolve_zone", no_zone)
+    with pytest.raises(CloudflareError):
+        api.deploy(
+            str(fixtures_dir / "simple_dockerfile"), "app.example.com", env_file=_env_file(tmp_path)
+        )
+
+    record = StateStore().require("simple-dockerfile")
+    assert record.tunnel_id == "tun-abc"
+    assert record.dns_record_id == ""
+
+    def must_not_touch_dns(*a, **kw):
+        raise AssertionError("no DNS record was created, so none should be deleted")
+
+    monkeypatch.setattr(api.dns_mod, "delete_record", must_not_touch_dns)
+    result = api.destroy("simple-dockerfile", env_file=_env_file(tmp_path))
+    assert result.tunnel_deleted is True
+    assert result.state_removed is True
+    assert StateStore().get("simple-dockerfile") is None
+
+
+def test_destroy_keeps_state_when_tunnel_delete_fails(monkeypatch, tmp_path, fixtures_dir):
+    _mock_everything(monkeypatch, tmp_path)
+    api.deploy(str(fixtures_dir / "simple_dockerfile"), "app.example.com", env_file=_env_file(tmp_path))
+
+    def boom(*a, **kw):
+        raise CloudflareError("Cloudflare rejected DELETE: 1022: active connections")
+
+    monkeypatch.setattr(api.tunnel_mod, "delete_tunnel", boom)
+    result = api.destroy("simple-dockerfile", env_file=_env_file(tmp_path))
+    assert result.state_removed is False
+    assert StateStore().get("simple-dockerfile") is not None
+
+
+def test_destroy_drops_state_when_dns_is_owned_by_someone_else(
+    monkeypatch, tmp_path, fixtures_dir
+):
+    _mock_everything(monkeypatch, tmp_path)
+    api.deploy(str(fixtures_dir / "simple_dockerfile"), "app.example.com", env_file=_env_file(tmp_path))
+
+    def not_ours(*a, **kw):
+        raise OwnershipError("no longer marked as managed by portal")
+
+    monkeypatch.setattr(api.dns_mod, "delete_record", not_ours)
+    result = api.destroy("simple-dockerfile", env_file=_env_file(tmp_path))
+    assert result.state_removed is True
+
+
+def test_same_dir_name_elsewhere_is_refused(monkeypatch, tmp_path, fixtures_dir):
+    _mock_everything(monkeypatch, tmp_path)
+    api.deploy(str(fixtures_dir / "simple_dockerfile"), "app.example.com", env_file=_env_file(tmp_path))
+
+    twin = tmp_path / "elsewhere" / "simple_dockerfile"
+    shutil.copytree(fixtures_dir / "simple_dockerfile", twin)
+    with pytest.raises(PortalError, match="already exists"):
+        api.deploy(str(twin), "other.example.com", env_file=_env_file(tmp_path))
+
+    result = api.deploy(str(twin), "other.example.com", name="twin", env_file=_env_file(tmp_path))
+    assert result.slug == "twin"
+    assert StateStore().get("simple-dockerfile").fqdn == "app.example.com"
+
+
+def test_redeploy_to_new_host_removes_old_record(monkeypatch, tmp_path, fixtures_dir):
+    _mock_everything(monkeypatch, tmp_path)
+    api.deploy(str(fixtures_dir / "simple_dockerfile"), "old.example.com", env_file=_env_file(tmp_path))
+
+    deleted = []
+    monkeypatch.setattr(api.dns_mod, "upsert_cname", lambda *a, **kw: "rec-2")
+    monkeypatch.setattr(
+        api.dns_mod, "delete_record", lambda client, zone, rec, slug: deleted.append(rec) or True
+    )
+    api.deploy(str(fixtures_dir / "simple_dockerfile"), "new.example.com", env_file=_env_file(tmp_path))
+
+    assert deleted == ["rec-1"]
+    record = StateStore().require("simple-dockerfile")
+    assert (record.fqdn, record.dns_record_id) == ("new.example.com", "rec-2")
+
+
+def test_redeploy_same_host_keeps_record(monkeypatch, tmp_path, fixtures_dir):
+    _mock_everything(monkeypatch, tmp_path)
+    api.deploy(str(fixtures_dir / "simple_dockerfile"), "app.example.com", env_file=_env_file(tmp_path))
+
+    def must_not_delete(*a, **kw):
+        raise AssertionError("same record id, nothing to remove")
+
+    monkeypatch.setattr(api.dns_mod, "delete_record", must_not_delete)
+    api.deploy(str(fixtures_dir / "simple_dockerfile"), "app.example.com", env_file=_env_file(tmp_path))

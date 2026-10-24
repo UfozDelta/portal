@@ -22,6 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     p_deploy.add_argument("--host", required=True)
     p_deploy.add_argument("--port", type=int, default=None)
     p_deploy.add_argument("--service", default=None)
+    p_deploy.add_argument("--name", default=None, help="deployment name (default: dir name)")
     p_deploy.add_argument(
         "--docker-host",
         default=None,
@@ -43,6 +44,7 @@ def main(argv: list[str] | None = None) -> int:
     p_inspect.add_argument("path")
     p_inspect.add_argument("--port", type=int, default=None)
     p_inspect.add_argument("--service", default=None)
+    p_inspect.add_argument("--name", default=None)
 
     args = parser.parse_args(argv)
     if args.verbose:
@@ -55,17 +57,22 @@ def main(argv: list[str] | None = None) -> int:
                 args.host,
                 port=args.port,
                 service=args.service,
+                name=args.name,
                 docker_host=args.docker_host,
             )
             print(f"live at {result.live_url}  ({result.probe})")
         elif args.command == "destroy":
             result = api.destroy(args.slug, volumes=args.volumes, docker_host=args.docker_host)
-            print(f"destroyed {result.slug}")
+            if result.state_removed:
+                print(f"destroyed {result.slug}")
+            else:
+                print(f"partially destroyed {result.slug}; run destroy again to finish")
+                return 1
         elif args.command == "status":
             for r in api.status(args.slug, probe=not args.no_probe):
                 print(f"{r.record.slug}  https://{r.record.fqdn}  {r.probe or ''}")
         elif args.command == "inspect":
-            plan = api.inspect(args.path, port=args.port, service=args.service)
+            plan = api.inspect(args.path, port=args.port, service=args.service, name=args.name)
             print(plan.to_dict())
     except PortalError as exc:
         print(f"error: {exc}", file=sys.stderr)

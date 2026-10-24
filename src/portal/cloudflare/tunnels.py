@@ -41,7 +41,28 @@ def get_tunnel_token(client, account_id: str, tunnel_id: str) -> str:
     return token
 
 
-def delete_tunnel(client, account_id: str, tunnel_id: str) -> None:
+def delete_tunnel(client, account_id: str, tunnel_id: str) -> bool:
     """Deleting the tunnel takes its ingress config with it — for one tunnel per
-    project that is simpler than unwinding the config rule by rule."""
-    client.delete(f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}")
+    project that is simpler than unwinding the config rule by rule.
+
+    Cloudflare refuses to delete a tunnel that still has active connections,
+    and a connector that was just stopped can linger as "connected" for a
+    while. So stale connections are cleaned up first (best effort), and the
+    caller is expected to have stopped cloudflared before calling this.
+
+    Returns False if the tunnel was already gone.
+    """
+    base = f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}"
+    try:
+        client.delete(f"{base}/connections")
+    except CloudflareError as exc:
+        if exc.status_code == 404:
+            return False
+        # not fatal on its own — the delete below reports the real problem
+    try:
+        client.delete(base)
+    except CloudflareError as exc:
+        if exc.status_code == 404:
+            return False
+        raise
+    return True
