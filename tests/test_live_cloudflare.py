@@ -28,6 +28,7 @@ import uuid
 
 import pytest
 
+from portal.cloudflare import credentials
 from portal.cloudflare import dns as dns_mod
 from portal.cloudflare import tunnels as tunnel_mod
 from portal.cloudflare.client import CloudflareClient
@@ -52,12 +53,12 @@ def live_client() -> tuple[CloudflareClient, str]:
         pytest.skip(f"no usable .env for a live test: {exc}")
 
     client = CloudflareClient(settings.token)
-    verified = client.verify_token(account_id=settings.account_id)
-    print(f"\ntoken: {verified.get('status', 'unknown')}")
-
-    account_id = settings.account_id or client.resolve_account_id()
-    print(f"account: {account_id}")
-    return client, account_id
+    report = credentials.check(client, settings.account_id)
+    print()
+    for c in report.checks:
+        print(f"{c.name}: {'ok' if c.ok else 'FAIL'} - {c.detail}")
+    assert report.ok, report.failures()
+    return client, report.account_id
 
 
 def test_live_tunnel_create_verify_delete(live_client):

@@ -14,7 +14,8 @@ import shutil
 import pytest
 
 from portal import api
-from portal.errors import CloudflareError, OwnershipError, PortalError
+from portal.cloudflare.credentials import Check, CredentialReport
+from portal.errors import CloudflareError, ConfigError, OwnershipError, PortalError
 from portal.state import StateStore
 
 
@@ -39,16 +40,34 @@ def _mock_everything(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(api.tunnel_mod, "delete_tunnel", lambda *a, **kw: True)
     monkeypatch.setattr(api.ingress_mod, "put_config", lambda *a, **kw: {})
-    monkeypatch.setattr(
-        api.dns_mod,
-        "resolve_zone",
-        lambda *a, **kw: {"id": "zone-1", "name": "example.com"},
-    )
     monkeypatch.setattr(api.dns_mod, "upsert_cname", lambda *a, **kw: "rec-1")
     monkeypatch.setattr(api.dns_mod, "delete_record", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        api.credentials,
+        "check",
+        lambda client, account_id, host: CredentialReport(
+            checks=[Check("token", True, "active account token")],
+            account_id="acct-1",
+            zone={"id": "zone-1", "name": "example.com"},
+        ),
+    )
 
-    monkeypatch.setattr(api, "_account_id", lambda client, settings: "acct-1")
     monkeypatch.setattr(api, "_probe", lambda fqdn: "HTTP 200")
+
+
+def _fast_clock(monkeypatch):
+    # time.sleep(0) still advances wall-clock time as far as time.monotonic()
+    # is concerned, so faking sleep alone doesn't shorten the retry window —
+    # fake the clock itself so the deadline trips after a couple of iterations
+    # instead of a real minute.
+    fake_time = [0.0]
+
+    def fake_monotonic():
+        fake_time[0] += 25.0
+        return fake_time[0]
+
+    monkeypatch.setattr(api.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(api.time, "sleep", lambda _seconds: None)
 
 
 def _env_file(tmp_path):
@@ -128,19 +147,7 @@ def test_deploy_never_verified_when_the_probe_never_answers(
 ):
     _mock_everything(monkeypatch, tmp_path)
     monkeypatch.setattr(api, "_probe", lambda fqdn: "unreachable (ConnectionError)")
-
-    # time.sleep(0) still advances wall-clock time as far as time.monotonic()
-    # is concerned, so faking sleep alone doesn't shorten the 60s retry
-    # window — fake the clock itself so the deadline trips after a couple of
-    # iterations instead of a real minute.
-    fake_time = [0.0]
-
-    def fake_monotonic():
-        fake_time[0] += 25.0
-        return fake_time[0]
-
-    monkeypatch.setattr(api.time, "monotonic", fake_monotonic)
-    monkeypatch.setattr(api.time, "sleep", lambda _seconds: None)
+    _fast_clock(monkeypatch)
 
     result = api.deploy(
         str(fixtures_dir / "simple_dockerfile"),
@@ -153,15 +160,23 @@ def test_deploy_never_verified_when_the_probe_never_answers(
     assert "unreachable" in result.probe
 
 
-def _fast_clock(monkeypatch):
-    fake_time = [0.0]
+def test_bad_token_fails_before_any_container_starts(monkeypatch, tmp_path, fixtures_dir):
+    _mock_everything(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        api.credentials,
+        "check",
+        lambda *a, **kw: CredentialReport(checks=[Check("token", False, "token is expired")]),
+    )
 
-    def fake_monotonic():
-        fake_time[0] += 25.0
-        return fake_time[0]
+    def must_not_start(**kw):
+        raise AssertionError("compose up must not run with an unusable token")
 
-    monkeypatch.setattr(api.time, "monotonic", fake_monotonic)
-    monkeypatch.setattr(api.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(api.docker, "compose_up", must_not_start)
+    with pytest.raises(ConfigError, match="token is expired"):
+        api.deploy(
+            str(fixtures_dir / "simple_dockerfile"), "app.example.com", env_file=_env_file(tmp_path)
+        )
+    assert StateStore().get("simple-dockerfile") is None
 
 
 def test_cloudflare_edge_error_is_not_verified(monkeypatch, tmp_path, fixtures_dir):
@@ -219,10 +234,10 @@ def test_destroy_stops_cloudflared_before_deleting_tunnel(monkeypatch, tmp_path,
 def test_failed_deploy_leaves_state_that_destroy_can_clean_up(monkeypatch, tmp_path, fixtures_dir):
     _mock_everything(monkeypatch, tmp_path)
 
-    def no_zone(*a, **kw):
-        raise CloudflareError("No Cloudflare zone in this account matches")
+    def dns_refused(*a, **kw):
+        raise OwnershipError("A DNS record for app.example.com already exists")
 
-    monkeypatch.setattr(api.dns_mod, "resolve_zone", no_zone)
+    monkeypatch.setattr(api.dns_mod, "upsert_cname", dns_refused)
     with pytest.raises(CloudflareError):
         api.deploy(
             str(fixtures_dir / "simple_dockerfile"), "app.example.com", env_file=_env_file(tmp_path)

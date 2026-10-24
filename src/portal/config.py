@@ -31,6 +31,12 @@ def project_dir(slug: str) -> Path:
 _SLUG_STRIP = re.compile(r"[^a-z0-9]+")
 
 
+def resource_prefix(slug: str) -> str:
+    """The one name every resource for a deployment starts with: compose
+    project, docker network, tunnel, and (with a suffix) its containers."""
+    return f"portal-{slug}"
+
+
 def slugify(name: str) -> str:
     """Project directory name -> a docker/DNS-safe slug."""
     slug = _SLUG_STRIP.sub("-", name.lower()).strip("-")

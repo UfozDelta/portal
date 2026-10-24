@@ -22,13 +22,21 @@ class DockerError(PortalError):
 class CloudflareError(PortalError):
     """The Cloudflare API rejected a request or returned something unusable.
 
-    `status_code` is the HTTP status when there was a response at all, so
-    callers can tell "that thing is already gone" (404) apart from a real
-    failure without string-matching the message."""
+    `status_code` is the HTTP status when there was a response at all, and
+    `codes` are Cloudflare's own error codes from the body, so callers can
+    tell "that thing is already gone" (404) or "not this kind of token"
+    (1000) apart from a real failure without string-matching the message."""
 
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        codes: tuple[int, ...] = (),
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.codes = codes
 
 
 class OwnershipError(CloudflareError):

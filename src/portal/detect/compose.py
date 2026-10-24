@@ -8,6 +8,7 @@ from pathlib import Path
 import yaml
 
 from ..errors import DetectionError
+from .dockerfile import parse_port
 
 COMPOSE_NAMES = (
     "compose.yml",
@@ -141,15 +142,8 @@ def _port_from_ports_entry(entry) -> int | None:
     "8080", "80:8080", "127.0.0.1:80:8080", optionally with "/tcp".
     """
     if isinstance(entry, dict):
-        target = entry.get("target")
-        return int(target) if str(target).isdigit() else None
-
-    text = str(entry).split("/", 1)[0]
-    parts = text.split(":")
-    tail = parts[-1]
-    if "-" in tail:  # a range like 8000-8010; take the low end
-        tail = tail.split("-", 1)[0]
-    return int(tail) if tail.isdigit() else None
+        return parse_port(entry.get("target"))
+    return parse_port(str(entry).split("/", 1)[0].split(":")[-1])
 
 
 def service_ports(spec: dict) -> list[int]:
@@ -161,9 +155,9 @@ def service_ports(spec: dict) -> list[int]:
     found: list[int] = []
 
     for entry in spec.get("expose") or []:
-        text = str(entry).split("/", 1)[0]
-        if text.isdigit() and int(text) not in found:
-            found.append(int(text))
+        port = parse_port(entry)
+        if port is not None and port not in found:
+            found.append(port)
 
     for entry in spec.get("ports") or []:
         port = _port_from_ports_entry(entry)

@@ -7,11 +7,12 @@ managed tunnel would need a config file inside the cloudflared container.
 
 from __future__ import annotations
 
+from ..config import resource_prefix
 from ..errors import CloudflareError
 
 
 def tunnel_name(slug: str) -> str:
-    return f"portal-{slug}"
+    return resource_prefix(slug)
 
 
 def create_tunnel(client, account_id: str, slug: str) -> dict:

@@ -45,7 +45,8 @@ python -c "import portal; print(portal.__version__)"
 
 If the import fails, install it once: `pip install -e .` from the portal repo root (create the venv first if missing: `python -m venv .venv`).
 
-If a call fails asking for a token, the user needs a `.env` in the portal repo root with `CLOUDFLARE_API_TOKEN=...` (see `.env.example`). There is no separate init step — `.env` is the only config source. Tell them plainly and stop — you cannot supply credentials yourself.
+Then check the Cloudflare token (read-only, creates nothing):
+`python -m portal check` — add `--host <fqdn>` once you know the hostname to also check zone and DNS access. Each line is `ok` or `FAIL` with the reason (invalid, expired, disabled, missing a permission). If there's no token at all, the user needs a `.env` in the portal repo root with `CLOUDFLARE_API_TOKEN=...` (see `.env.example`); there is no separate init step. On any FAIL, tell them plainly what the line says and stop — you cannot supply or fix credentials yourself.
 
 ## Workflow
 
@@ -53,7 +54,7 @@ If a call fails asking for a token, the user needs a `.env` in the portal repo r
 2. **Always inspect first**, even if the user only asked to deploy:
    `python -c "from portal.api import inspect; print(inspect('<path>').to_dict())"`
    Show them what portal detected (service, port, env status) before proceeding — this is the plan-before-action step, don't skip it by going straight to deploy with assumed arguments.
-3. **Resolve the hostname.** If the user gave a full FQDN, use it. If they only gave a subdomain word, ask which zone/domain it goes under — don't guess a domain they didn't say.
+3. **Resolve the hostname.** If the user gave a full FQDN, use it. If they only gave a subdomain word, ask which zone/domain it goes under — don't guess a domain they didn't say. Then run `python -m portal check --host <fqdn>`; a FAIL here means deploy would fail too (deploy runs the same checks), so report it instead of deploying.
 4. **Resolve where it runs.** By default the containers run on the local docker daemon. If the user says "on the other machine", "deploy this to <server>", or names a remote host, pass `docker_host="ssh://user@host"` — portal's local docker CLI proxies every command over SSH, nothing needs installing remotely beyond docker + sshd. Confirm the SSH target with the user if it's ambiguous; don't guess a hostname or user they didn't give you.
 5. **Get explicit confirmation in chat before deploying.** `portal.api.deploy()` itself never prompts — it just does the thing the moment you call it. That confirmation step is now your job, not the library's. Show the inspect output (and the resolved docker_host, if remote), get a yes, then run:
    `python -c "from portal.api import deploy; r = deploy('<path>', host='<fqdn>', docker_host='<ssh-target-or-None>'); print(r)"`

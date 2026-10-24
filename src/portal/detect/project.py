@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..config import slugify
+from ..config import resource_prefix, slugify
 from ..errors import DetectionError
 from . import compose as compose_mod
 from . import dockerfile as dockerfile_mod
@@ -36,19 +36,19 @@ class ProjectPlan:
 
     @property
     def container_name(self) -> str:
-        return f"portal-{self.slug}-{self.service}"
+        return f"{resource_prefix(self.slug)}-{self.service}"
 
     @property
     def network(self) -> str:
-        return f"portal-{self.slug}"
+        return resource_prefix(self.slug)
 
     @property
     def compose_project(self) -> str:
-        return f"portal-{self.slug}"
+        return resource_prefix(self.slug)
 
     @property
     def cloudflared_container(self) -> str:
-        return f"portal-{self.slug}-cloudflared"
+        return f"{resource_prefix(self.slug)}-cloudflared"
 
     @property
     def origin_url(self) -> str:

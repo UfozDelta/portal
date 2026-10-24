@@ -40,6 +40,9 @@ def main(argv: list[str] | None = None) -> int:
     p_status.add_argument("slug", nargs="?", default=None)
     p_status.add_argument("--no-probe", action="store_true")
 
+    p_check = sub.add_parser("check", help="check the Cloudflare token, read-only")
+    p_check.add_argument("--host", default=None, help="also check zone and DNS access for it")
+
     p_inspect = sub.add_parser("inspect", help="report what would be deployed")
     p_inspect.add_argument("path")
     p_inspect.add_argument("--port", type=int, default=None)
@@ -71,6 +74,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "status":
             for r in api.status(args.slug, probe=not args.no_probe):
                 print(f"{r.record.slug}  https://{r.record.fqdn}  {r.probe or ''}")
+        elif args.command == "check":
+            report = api.check(args.host)
+            for c in report.checks:
+                print(f"{'ok' if c.ok else 'FAIL':4}  {c.name:8} {c.detail}")
+            if not report.ok:
+                return 1
         elif args.command == "inspect":
             plan = api.inspect(args.path, port=args.port, service=args.service, name=args.name)
             print(plan.to_dict())

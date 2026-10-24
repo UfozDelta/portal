@@ -81,13 +81,14 @@ class CloudflareClient:
             ) from None
 
         if not body.get("success", False):
+            errors = body.get("errors") or []
             messages = "; ".join(
-                f"{e.get('code', '?')}: {e.get('message', '')}"
-                for e in body.get("errors") or []
+                f"{e.get('code', '?')}: {e.get('message', '')}" for e in errors
             ) or f"HTTP {resp.status_code}"
             raise CloudflareError(
                 f"Cloudflare rejected {method} {path}: {self._scrub(messages)}",
                 status_code=resp.status_code,
+                codes=tuple(e["code"] for e in errors if isinstance(e.get("code"), int)),
             )
         return body
 
@@ -103,39 +104,26 @@ class CloudflareClient:
     def delete(self, path: str) -> dict:
         return self.request("DELETE", path)
 
-    def verify_token(self, account_id: str | None = None) -> dict:
-        """Prove the token is live and unexpired.
+    def verify_token(self, account_id: str) -> dict:
+        """The token's own record: `status` ("active", "disabled", "expired"),
+        `expires_on` if it has one, and `kind` ("account" or "user").
 
-        /user/tokens/verify only recognizes classic *User* API Tokens. A newer
-        *Account-Owned* API Token is equally valid but gets rejected there with
-        the same "1000: Invalid API Token" error a genuinely bad token would
-        give — a known Cloudflare false negative, not a real auth failure.
-
-        When account_id is known, /accounts/{id}/tokens/verify is the right
-        check to make first: it verifies the token against itself, scoped to
-        one account, and needs no permission beyond what the token already
-        has — unlike the /accounts list fallback below, which needs a broad
-        Account:Read scope that a minimally-scoped account-owned token (just
-        Tunnel:Edit/DNS:Edit/Zone:Read, say) may not have, and would then
-        fail even though the token is genuinely fine.
+        There are two kinds of API token and each has its own verify endpoint.
+        Each endpoint answers the other kind with the same "1000: Invalid API
+        Token" a genuinely bad token gets — a known Cloudflare false negative.
+        So try the account-scoped endpoint, fall back to the user one on 1000,
+        and only a token both reject is really invalid. Neither endpoint needs
+        any permission beyond the token itself.
         """
-        if account_id:
-            try:
-                return self.get(f"/accounts/{account_id}/tokens/verify")["result"]
-            except CloudflareError as exc:
-                if "1000:" not in str(exc):
-                    raise
-                # not a real User token either — fall through to the
-                # unscoped checks below, which still correctly reject a
-                # genuinely bad token.
-
         try:
-            return self.get("/user/tokens/verify")["result"]
+            result = self.get(f"/accounts/{account_id}/tokens/verify")["result"]
+            kind = "account"
         except CloudflareError as exc:
-            if "1000:" not in str(exc):
+            if 1000 not in exc.codes:
                 raise
-            self.get("/accounts", params={"per_page": 1})
-            return {"status": "active (account-owned token)"}
+            result = self.get("/user/tokens/verify")["result"]
+            kind = "user"
+        return {**result, "kind": kind}
 
     def resolve_account_id(self) -> str:
         accounts = self.get("/accounts", params={"per_page": 50})["result"]

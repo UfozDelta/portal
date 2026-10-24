@@ -18,13 +18,15 @@ from pathlib import Path
 
 import requests
 
+from .cloudflare import credentials
 from .cloudflare import dns as dns_mod
 from .cloudflare import ingress as ingress_mod
 from .cloudflare import tunnels as tunnel_mod
 from .cloudflare.client import CloudflareClient
-from .config import project_dir
+from .cloudflare.credentials import CredentialReport
+from .config import project_dir, resource_prefix
 from .detect import ProjectPlan, detect
-from .errors import DockerError, OwnershipError, PortalError
+from .errors import ConfigError, DockerError, OwnershipError, PortalError
 from .runtime import docker, override
 from .settings import Settings, load_settings
 from .state import ProjectRecord, StateStore
@@ -32,9 +34,11 @@ from .state import ProjectRecord, StateStore
 log = logging.getLogger("portal")
 
 __all__ = [
+    "CredentialReport",
     "DeployResult",
     "DestroyResult",
     "StatusResult",
+    "check",
     "deploy",
     "destroy",
     "status",
@@ -76,10 +80,6 @@ class StatusResult:
 
 def _client(settings: Settings) -> CloudflareClient:
     return CloudflareClient(settings.token)
-
-
-def _account_id(client: CloudflareClient, settings: Settings) -> str:
-    return settings.account_id or client.resolve_account_id()
 
 
 def _compose_files(plan: ProjectPlan) -> list[Path]:
@@ -148,6 +148,19 @@ def _app_answered(probe: str) -> bool:
     return bool(match) and int(match.group(1)) not in EDGE_ERROR_STATUSES
 
 
+def _poll(read, done, *, timeout: float, interval: float) -> tuple[bool, str]:
+    """Call read() until done(result) or the timeout passes. Returns whether it
+    finished and the last result ("" if it never got to read)."""
+    deadline = time.monotonic() + timeout
+    last = ""
+    while time.monotonic() < deadline:
+        last = read()
+        if done(last):
+            return True, last
+        time.sleep(interval)
+    return False, last
+
+
 def _wait_for_container(
     name: str, *, docker_host: str | None = None, timeout: float = 30, interval: float = 1.5
 ) -> None:
@@ -155,31 +168,42 @@ def _wait_for_container(
     returns as soon as the container is created — a bad image/command can exit
     it a second later, and creating cloud resources for that is wasted API
     calls plus a tunnel pointed at nothing."""
-    deadline = time.monotonic() + timeout
-    last = ""
-    while time.monotonic() < deadline:
-        last = docker.container_status(name, docker_host=docker_host)
-        if last.lower().startswith("up"):
-            return
-        time.sleep(interval)
-    raise DockerError(
-        f"{name} did not reach a running state within {timeout:.0f}s "
-        f"(last status: {last or 'not found'}). Check `docker logs {name}`."
+    up, last = _poll(
+        lambda: docker.container_status(name, docker_host=docker_host),
+        lambda s: s.lower().startswith("up"),
+        timeout=timeout,
+        interval=interval,
     )
+    if not up:
+        raise DockerError(
+            f"{name} did not reach a running state within {timeout:.0f}s "
+            f"(last status: {last or 'not found'}). Check `docker logs {name}`."
+        )
 
 
 def _wait_for_http(fqdn: str, *, timeout: float = 60, interval: float = 3) -> tuple[bool, str]:
     """Poll the public hostname until it answers or the timeout passes. DNS and
     the tunnel can take a few seconds to settle after being created, so a
     single immediate curl is expected to fail even on a good deploy."""
-    deadline = time.monotonic() + timeout
-    result = "not checked"
-    while time.monotonic() < deadline:
-        result = _probe(fqdn)
-        if _app_answered(result):
-            return True, result
-        time.sleep(interval)
-    return False, result
+    answered, last = _poll(
+        lambda: _probe(fqdn), _app_answered, timeout=timeout, interval=interval
+    )
+    return answered, last or "not checked"
+
+
+def check(host: str | None = None, *, env_file: str | Path | None = None) -> CredentialReport:
+    """Check the Cloudflare token without creating anything: that it is
+    active (and when it expires), that it can reach tunnels, and — given a
+    host — that a zone covers it and its DNS records are reachable.
+    deploy() runs the same checks before starting any containers.
+
+    Raises ConfigError only when there is no token at all; every other
+    problem is reported in the result (`report.ok`, `report.checks`).
+    """
+    settings = load_settings(env_file)
+    return credentials.check(
+        _client(settings), settings.account_id, _normalize_host(host) if host else None
+    )
 
 
 def deploy(
@@ -226,7 +250,14 @@ def deploy(
     docker.ensure_daemon_running(docker_host=docker_host)
     settings = load_settings(env_file)
     client = _client(settings)
-    account_id = _account_id(client, settings)
+    # Before any container starts: a bad token should fail here, not after a
+    # full build with the app already running.
+    report = credentials.check(client, settings.account_id, host)
+    if not report.ok:
+        raise ConfigError(
+            "The Cloudflare token can't do everything deploy needs:\n" + report.failures()
+        )
+    account_id, zone = report.account_id, report.zone
 
     files = _compose_files(plan)
 
@@ -275,7 +306,7 @@ def deploy(
     tunnel_id = tunnel["id"]
     record = replace(record, tunnel_id=tunnel_id)
     store.put(record)
-    tunnel_token =tunnel_mod.get_tunnel_token(client, account_id, tunnel_id)
+    tunnel_token = tunnel_mod.get_tunnel_token(client, account_id, tunnel_id)
 
     log.info("starting %s", plan.cloudflared_container)
     docker.run_cloudflared(
@@ -291,9 +322,8 @@ def deploy(
         client, account_id, tunnel_id, ingress_mod.build_config(host, plan.origin_url)
     )
 
-    zone = dns_mod.resolve_zone(client, host)
     log.info("zone %s (%s)", zone["name"], zone["id"])
-    record_id = dns_mod.upsert_cname(client, zone["id"], host, tunnel_id, plan.slug)
+    record_id =dns_mod.upsert_cname(client, zone["id"], host, tunnel_id, plan.slug)
     log.info("CNAME %s -> %s (proxied)", host, dns_mod.tunnel_target(tunnel_id))
 
     if previous and previous.dns_record_id and previous.dns_record_id != record_id:
@@ -378,7 +408,7 @@ def destroy(
     tunnel_deleted = False
     if record.tunnel_id:
         try:
-            account_id = _account_id(client, settings)
+            account_id = settings.account_id or client.resolve_account_id()
             tunnel_deleted = tunnel_mod.delete_tunnel(client, account_id, record.tunnel_id)
             log.info(
                 "tunnel %s %s",
@@ -391,7 +421,7 @@ def destroy(
 
     files = [Path(record.compose_file), Path(record.override_file)]
     docker.compose_down(
-        project=f"portal-{slug}",
+        project=resource_prefix(slug),
         files=[f for f in files if f.exists()],
         volumes=volumes,
         docker_host=docker_host,
@@ -424,16 +454,15 @@ def status(slug: str | None = None, *, probe: bool = True) -> list[StatusResult]
     store = StateStore()
     records = [store.require(slug)] if slug else store.list()
 
-    return [
-        StatusResult(
+    def one(record: ProjectRecord) -> StatusResult:
+        host = record.docker_host or None
+        return StatusResult(
             record=record,
-            container_status=docker.container_status(
-                record.container_name, docker_host=record.docker_host or None
-            ),
+            container_status=docker.container_status(record.container_name, docker_host=host),
             cloudflared_status=docker.container_status(
-                record.cloudflared_container, docker_host=record.docker_host or None
+                record.cloudflared_container, docker_host=host
             ),
             probe=_probe(record.fqdn) if probe else None,
         )
-        for record in sorted(records, key=lambda r: r.slug)
-    ]
+
+    return [one(record) for record in sorted(records, key=lambda r: r.slug)]

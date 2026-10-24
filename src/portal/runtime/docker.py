@@ -61,24 +61,14 @@ def ensure_daemon_running(*, docker_host: str | None = None) -> None:
     `docker info` is the cheapest call that actually talks to the daemon
     rather than just the CLI.
     """
-    exe = _require_docker()
     try:
-        proc = subprocess.run(
-            [exe, "info"],
-            capture_output=True,
-            text=True,
-            check=False,
-            env=_build_env(docker_host),
-        )
-    except OSError as exc:
-        raise DockerError(f"Could not run `docker info`: {exc}") from None
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip()
+        run(["info"], env=_build_env(docker_host))
+    except DockerError as exc:
         where = f" at {docker_host}" if docker_host else ""
         raise DockerError(
             f"Docker daemon is not reachable{where} (is it running, and if "
-            f"remote, is SSH access to it working?).\n{detail}"
-        )
+            f"remote, is SSH access to it working?).\n{exc}"
+        ) from None
 
 
 def run(
@@ -125,6 +115,15 @@ def remove_network(name: str, *, docker_host: str | None = None) -> None:
         pass
 
 
+def _compose_args(project: str, files: list[Path]) -> list[str]:
+    """`compose -p PROJECT -f A -f B`: every compose call must name both the
+    project and the full file chain, or it acts on a different stack."""
+    args = ["compose", "-p", project]
+    for f in files:
+        args += ["-f", str(f)]
+    return args
+
+
 def compose_up(
     *,
     project: str,
@@ -133,9 +132,7 @@ def compose_up(
     env_file: Path | None = None,
     docker_host: str | None = None,
 ) -> None:
-    args = ["compose", "-p", project]
-    for f in files:
-        args += ["-f", str(f)]
+    args = _compose_args(project, files)
     if env_file is not None:
         args += ["--env-file", str(env_file)]
     args += ["up", "-d"]
@@ -151,9 +148,7 @@ def compose_down(
     volumes: bool = False,
     docker_host: str | None = None,
 ) -> None:
-    args = ["compose", "-p", project]
-    for f in files:
-        args += ["-f", str(f)]
+    args = _compose_args(project, files)
     args.append("down")
     if volumes:
         args.append("--volumes")

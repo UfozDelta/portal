@@ -63,8 +63,9 @@ the project's `.env.example` are missing.
 ## Usage
 
 ```python
-from portal.api import deploy, destroy, status, inspect
+from portal.api import check, deploy, destroy, status, inspect
 
+check("app.example.com").ok             # token active and able to deploy there?
 inspect("~/code/myapp")                 # detected plan, no side effects
 
 r = deploy("~/code/myapp", host="app.example.com")
@@ -93,11 +94,37 @@ portal logs progress to the `portal` logger. Call
 Warnings, such as keys from the project's `.env.example` that are missing from
 its `.env`, show up even without that.
 
+### Checking the token
+
+`check()` tests the Cloudflare token without creating anything and reports
+each result:
+
+```text
+$ python -m portal check --host app.example.com
+ok    token    active account token, expires 2027-01-31
+ok    tunnels  can list tunnels
+ok    zone     example.com covers app.example.com
+ok    dns      can read DNS records in example.com
+```
+
+It confirms the token is active (not expired, disabled, or revoked) and warns
+when it expires within a week. It works with both user tokens and newer
+account-owned tokens, which Cloudflare verifies at different endpoints. It then
+makes one cheap read call for each permission portal needs. `deploy()` runs
+the same checks before starting any containers, so a bad token fails in
+seconds instead of after a full build.
+
+One limit: a token can't read its own permission list, and Cloudflare offers no
+way to tell Read access from Edit access without writing something. A token
+with Read-only permissions passes `check()` and then fails at the first write
+during `deploy()`.
+
 ### From the shell
 
-The same four calls are available as a thin command-line wrapper:
+The same calls are available as a thin command-line wrapper:
 
 ```bash
+python -m portal check --host app.example.com
 python -m portal -v deploy ~/code/myapp --host app.example.com
 python -m portal inspect ~/code/myapp
 python -m portal status
@@ -105,8 +132,8 @@ python -m portal destroy myapp
 ```
 
 `deploy` and `inspect` take `--port`, `--service`, and `--name`. `deploy` also
-takes `--docker-host`. `destroy` exits with status 1 if cleanup was only
-partial.
+takes `--docker-host`. `check` and `destroy` exit with status 1 on failure or,
+for `destroy`, partial cleanup.
 
 <p align="center"><img src="docs/flow.svg" alt="deploy() flow: detect, docker up, wait, tunnel, ingress, DNS, curl-verify" width="720"></p>
 
@@ -115,7 +142,9 @@ partial.
 1. **Detect.** Finds the compose file, or a bare Dockerfile, and picks the
    service to expose. A service using `network_mode` is rejected, because
    compose can't attach it to portal's network.
-2. **Start the app.** Runs `docker compose -p portal-<slug> -f <yours> -f
+2. **Check credentials.** Runs the same read-only checks as `check()` and stops
+   with a list of what failed. Nothing has been started or created yet.
+3. **Start the app.** Runs `docker compose -p portal-<slug> -f <yours> -f
    <override> up -d --build`. portal never edits your compose file. It adds an
    override on top that sets a fixed `container_name`, joins the service to a
    per-project network (keeping any networks it already had), adds `portal.*`
@@ -127,29 +156,29 @@ partial.
 
    For a project with only a Dockerfile, portal generates a minimal compose
    file under `~/.portal/projects/<slug>/`, not inside your project.
-3. **Wait for the container.** `compose up -d` returns as soon as the
+4. **Wait for the container.** `compose up -d` returns as soon as the
    container is created, even if the container crashes a second later. portal
    waits up to 30 seconds for `docker ps` to report the container as `Up`, and
-   raises an error otherwise. Cloudflare isn't touched until the container is
-   running.
-4. **Create the tunnel.** portal creates a tunnel named `portal-<slug>`, or
+   raises an error otherwise. No Cloudflare resources are created until the
+   container is running.
+5. **Create the tunnel.** portal creates a tunnel named `portal-<slug>`, or
    reuses it if it already exists. The tunnel uses `config_src: cloudflare`, so
    its ingress rules are managed through the API instead of a local config file.
-5. **Start the sidecar.** Runs a pinned `cloudflare/cloudflared` image as
+6. **Start the sidecar.** Runs a pinned `cloudflare/cloudflared` image as
    `portal-<slug>-cloudflared` on the same network. Set
    `PORTAL_CLOUDFLARED_IMAGE` to use a different one. The tunnel token is passed
    to it through the environment, so it never appears in the `docker run`
    arguments.
-6. **Set ingress.** One rule for the hostname, followed by the required
+7. **Set ingress.** One rule for the hostname, followed by the required
    `http_status:404` catch-all.
-7. **Point DNS.** portal finds the zone by trying the hostname and then each
+8. **Point DNS.** portal finds the zone by trying the hostname and then each
    parent domain, longest first, so a zone apex works too. It then creates or
    updates a proxied CNAME to `<tunnel-id>.cfargotunnel.com` with the comment
    `managed by portal:<slug>`. If a record already exists for that name without this exact
    comment, portal refuses to change it. `destroy()` follows the same rule
    before deleting a record. If you redeploy a project under a new hostname,
    portal deletes the old record.
-8. **Verify.** portal requests `https://<host>` every 3 seconds for up to a
+9. **Verify.** portal requests `https://<host>` every 3 seconds for up to a
    minute. A new tunnel and DNS record often take a few seconds before they
    route traffic, so a single check right after setup would usually fail even
    when everything is fine. Any response from the app counts as success, error
@@ -250,8 +279,8 @@ pytest
 ```
 
 The tests cover project detection, ingress rule building, the state store and
-its lock, the compose override and synthesized compose files, zone lookup and
-the DNS ownership checks, the docker environment handling for `docker_host`,
+its lock, the compose override and synthesized compose files, the token checks,
+zone lookup and the DNS ownership checks, the docker environment handling for `docker_host`,
 `.env` loading, and the full `deploy()`/`status()`/`destroy()` orchestration
 with docker and Cloudflare stubbed out. The orchestration tests include
 half-finished deploys, redeploys to a new hostname, name collisions, and

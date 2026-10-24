@@ -9,6 +9,14 @@ from pathlib import Path
 _EXPOSE = re.compile(r"^\s*EXPOSE\s+(.+?)\s*$", re.IGNORECASE)
 
 
+def parse_port(token) -> int | None:
+    """One port token as Docker and compose write it: "8080", "8080/tcp", or a
+    range "8000-8010" (the low end is taken). None for anything else, such as
+    an unexpanded "$PORT"."""
+    text = str(token).split("/", 1)[0].split("-", 1)[0]
+    return int(text) if text.isdigit() else None
+
+
 def parse_expose(path: Path) -> list[int]:
     """Every port named by an EXPOSE line, in file order, deduped.
 
@@ -25,9 +33,7 @@ def parse_expose(path: Path) -> list[int]:
         if not match:
             continue
         for token in match.group(1).split():
-            number = token.split("/", 1)[0]
-            if number.isdigit():
-                value = int(number)
-                if value not in ports:
-                    ports.append(value)
+            value = parse_port(token)
+            if value is not None and value not in ports:
+                ports.append(value)
     return ports
